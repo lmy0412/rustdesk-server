@@ -7,7 +7,7 @@ use once_cell::sync::OnceCell;
 use serde_derive::{Deserialize, Serialize};
 use std::{
     fmt,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
@@ -546,6 +546,14 @@ impl AppConfig {
             .rsplit_once(':')
             .and_then(|(_, p)| p.parse().ok())
             .unwrap_or(RELAY_PORT)
+    }
+
+    /// Extract listen address from server.api_server.
+    pub fn api_server_addr(&self) -> Result<SocketAddr, String> {
+        self.server
+            .api_server
+            .parse::<SocketAddr>()
+            .map_err(|e| format!("invalid api_server '{}': {}", self.server.api_server, e))
     }
 
     /// Update the port portion of server.id_server.
@@ -1206,6 +1214,21 @@ mod tests {
     fn test_relay_server_port() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.relay_server_port(), 21117);
+    }
+
+    #[test]
+    fn test_api_server_addr_parse() {
+        let cfg = AppConfig::default();
+        let addr = cfg.api_server_addr().unwrap();
+        assert_eq!(addr.to_string(), "0.0.0.0:21114");
+    }
+
+    #[test]
+    fn test_api_server_addr_invalid() {
+        let mut cfg = AppConfig::default();
+        cfg.server.api_server = "invalid-addr".to_string();
+        let err = cfg.api_server_addr().unwrap_err();
+        assert!(err.contains("invalid api_server"));
     }
 
     #[test]

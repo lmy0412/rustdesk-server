@@ -3,6 +3,7 @@
 
 use flexi_logger::*;
 use hbb_common::{bail, config::RENDEZVOUS_PORT, log, ResultType};
+use hbbs::api;
 use hbbs::config::{AppConfig, ConfigTarget};
 use hbbs::{common::*, *};
 
@@ -36,6 +37,27 @@ fn main() -> ResultType<()> {
     let port = config.id_server_port();
     if port < 3 {
         bail!("Invalid port");
+    }
+    let api_addr = config.api_server_addr().unwrap_or_else(|err| {
+        eprintln!("Failed to parse api_server address: {}", err);
+        std::process::exit(1);
+    });
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let _api_thread = std::thread::spawn(move || {
+        api::api_server_forever(api_addr, ready_tx);
+    });
+    match ready_rx.recv() {
+        Ok(Ok(())) => {
+            log::info!("API server bind confirmed, starting RendezvousServer");
+        }
+        Ok(Err(err)) => {
+            eprintln!("Fatal: API server failed to start: {}", err);
+            std::process::exit(1);
+        }
+        Err(err) => {
+            eprintln!("Fatal: API server failed to start: {}", err);
+            std::process::exit(1);
+        }
     }
     let rmem = config.relay.rmem;
     let serial = config.rendezvous.serial;
