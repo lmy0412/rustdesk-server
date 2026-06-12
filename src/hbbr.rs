@@ -1,8 +1,9 @@
-use clap::App;
 mod common;
+mod config;
 mod relay_server;
+use config::{AppConfig, ConfigTarget};
 use flexi_logger::*;
-use hbb_common::{config::RELAY_PORT, ResultType};
+use hbb_common::{config::RELAY_PORT, log, ResultType};
 use relay_server::*;
 mod version;
 
@@ -13,33 +14,19 @@ fn main() -> ResultType<()> {
         .write_mode(WriteMode::Async)
         .start()?;
     let args = format!(
-        "-p, --port=[NUMBER(default={RELAY_PORT})] 'Sets the listening port'
+        "-c --config=[FILE] +takes_value 'Sets a custom config file'
+        -p, --port=[NUMBER(default={RELAY_PORT})] 'Sets the listening port'
         -k, --key=[KEY] 'Only allow the client with the same key'
         ",
     );
-    let matches = App::new("hbbr")
-        .version(version::VERSION)
-        .author("Purslane Ltd. <info@rustdesk.com>")
-        .about("RustDesk Relay Server")
-        .args_from_usage(&args)
-        .get_matches();
-    if let Ok(v) = ini::Ini::load_from_file(".env") {
-        if let Some(section) = v.section(None::<String>) {
-            section.iter().for_each(|(k, v)| std::env::set_var(k, v));
-        }
-    }
-    let mut port = RELAY_PORT;
-    if let Ok(v) = std::env::var("PORT") {
-        let v: i32 = v.parse().unwrap_or_default();
-        if v > 0 {
-            port = v + 1;
-        }
-    }
-    start(
-        matches.value_of("port").unwrap_or(&port.to_string()),
-        matches
-            .value_of("key")
-            .unwrap_or(&std::env::var("KEY").unwrap_or_default()),
-    )?;
+    let matches = common::init_args(&args, "hbbr", "RustDesk Relay Server");
+    let config =
+        AppConfig::load_with_cli_args(&matches, ConfigTarget::Hbbr).unwrap_or_else(|err| {
+            eprintln!("{}", err);
+            std::process::exit(1);
+        });
+    config.sync_to_legacy_env();
+    log::info!("loaded config:\n{}", config);
+    start(&config.relay_server_port().to_string(), &config.server.key)?;
     Ok(())
 }
