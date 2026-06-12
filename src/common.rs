@@ -1,6 +1,8 @@
-use clap::App;
+use clap::{App, ArgMatches};
 use hbb_common::{
-    allow_err, anyhow::{Context, Result}, get_version_number, log, tokio, ResultType
+    allow_err,
+    anyhow::{Context, Result},
+    get_version_number, log, tokio, ResultType,
 };
 use ini::Ini;
 use sodiumoxide::crypto::sign;
@@ -53,7 +55,7 @@ fn arg_name(name: &str) -> String {
 }
 
 #[allow(dead_code)]
-pub fn init_args(args: &str, name: &str, about: &str) {
+pub fn init_args<'a>(args: &'a str, name: &'static str, about: &'static str) -> ArgMatches<'a> {
     let matches = App::new(name)
         .version(crate::version::VERSION)
         .author("Purslane Ltd. <info@rustdesk.com>")
@@ -61,26 +63,22 @@ pub fn init_args(args: &str, name: &str, about: &str) {
         .args_from_usage(args)
         .get_matches();
     if let Ok(v) = Ini::load_from_file(".env") {
+        log::warn!(".env file detected, consider migrating to config.toml");
         if let Some(section) = v.section(None::<String>) {
             section
                 .iter()
                 .for_each(|(k, v)| std::env::set_var(arg_name(k), v));
         }
     }
-    if let Some(config) = matches.value_of("config") {
-        if let Ok(v) = Ini::load_from_file(config) {
-            if let Some(section) = v.section(None::<String>) {
-                section
-                    .iter()
-                    .for_each(|(k, v)| std::env::set_var(arg_name(k), v));
-            }
+    for (k, v) in matches.args.iter() {
+        if *k == "config" {
+            continue;
         }
-    }
-    for (k, v) in matches.args {
         if let Some(v) = v.vals.first() {
             std::env::set_var(arg_name(k), v.to_string_lossy().to_string());
         }
     }
+    matches
 }
 
 #[allow(dead_code)]
@@ -161,21 +159,60 @@ pub async fn listen_signal() -> Result<()> {
 
     tokio::spawn(async {
         let mut s = signal(SignalKind::terminate())?;
-        let terminate = s.recv();
+        let mut terminate = s.recv();
         let mut s = signal(SignalKind::interrupt())?;
-        let interrupt = s.recv();
+        let mut interrupt = s.recv();
         let mut s = signal(SignalKind::quit())?;
-        let quit = s.recv();
+        let mut quit = s.recv();
+        let mut s = signal(SignalKind::hangup())?;
+        let mut hangup = s.recv();
 
-        tokio::select! {
-            _ = terminate => {
-                log::info!("signal terminate");
-            }
-            _ = interrupt => {
-                log::info!("signal interrupt");
-            }
-            _ = quit => {
-                log::info!("signal quit");
+        loop {
+            tokio::select! {
+                _ = &mut terminate => {
+                    log::info!("signal terminate");
+                    break;
+                }
+                _ = &mut interrupt => {
+                    log::info!("signal interrupt");
+                    break;
+                }
+                _ = &mut quit => {
+                    log::info!("signal quit");
+                    break;
+                }
+                _ = &mut hangup => {
+                    log::info!("signal hangup, reloading config");
+                    match crate::config::reload_global_config() {
+                        Ok(result) => {
+                            if result.cold > 0 {
+                                log::info!(
+                                    "config reload checked: {} fields changed ({:?}), {} hot-applied, {} require restart; keeping running configuration",
+                                    result.changed_fields.len(),
+                                    result.changed_fields,
+                                    result.hot_applied,
+                                    result.cold
+                                );
+                            } else {
+                                log::info!(
+                                    "config reloaded: {} fields changed ({:?}), {} hot-applied, {} require restart",
+                                    result.changed_fields.len(),
+                                    result.changed_fields,
+                                    result.hot_applied,
+                                    result.cold
+                                );
+                            }
+                            for field in result.changed_fields {
+                                log::warn!("{} changed, requires restart", field);
+                            }
+                        }
+                        Err(err) => {
+                            log::error!("config reload failed: {}", err);
+                            log::info!("keeping previous valid configuration");
+                        }
+                    }
+                    hangup = s.recv();
+                }
             }
         }
         Ok(())
@@ -189,7 +226,6 @@ pub async fn listen_signal() -> Result<()> {
     unreachable!();
 }
 
-
 pub fn check_software_update() {
     const ONE_DAY_IN_SECONDS: u64 = 60 * 60 * 24;
     std::thread::spawn(move || loop {
@@ -200,8 +236,10 @@ pub fn check_software_update() {
 
 #[tokio::main(flavor = "current_thread")]
 async fn check_software_update_() -> hbb_common::ResultType<()> {
-    let (request, url) = hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_SERVER.to_string());
-    let latest_release_response = reqwest::Client::builder().build()?
+    let (request, url) =
+        hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_SERVER.to_string());
+    let latest_release_response = reqwest::Client::builder()
+        .build()?
         .post(url)
         .json(&request)
         .send()
@@ -212,7 +250,7 @@ async fn check_software_update_() -> hbb_common::ResultType<()> {
     let response_url = resp.url;
     let latest_release_version = response_url.rsplit('/').next().unwrap_or_default();
     if get_version_number(&latest_release_version) > get_version_number(crate::version::VERSION) {
-       log::info!("new version is available: {}", latest_release_version);
+        log::info!("new version is available: {}", latest_release_version);
     }
     Ok(())
 }

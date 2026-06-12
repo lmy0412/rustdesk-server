@@ -2,7 +2,8 @@
 // https://blog.csdn.net/bytxl/article/details/44344855
 
 use flexi_logger::*;
-use hbb_common::{bail, config::RENDEZVOUS_PORT, ResultType};
+use hbb_common::{bail, config::RENDEZVOUS_PORT, log, ResultType};
+use hbbs::config::{AppConfig, ConfigTarget};
 use hbbs::{common::*, *};
 
 const RMEM: usize = 0;
@@ -24,14 +25,21 @@ fn main() -> ResultType<()> {
         , --mask=[MASK] 'Determine if the connection comes from LAN, e.g. 192.168.0.0/16'
         -k, --key=[KEY] 'Only allow the client with the same key'",
     );
-    init_args(&args, "hbbs", "RustDesk ID/Rendezvous Server");
-    let port = get_arg_or("port", RENDEZVOUS_PORT.to_string()).parse::<i32>()?;
+    let matches = init_args(&args, "hbbs", "RustDesk ID/Rendezvous Server");
+    let config =
+        AppConfig::load_with_cli_args(&matches, ConfigTarget::Hbbs).unwrap_or_else(|err| {
+            eprintln!("{}", err);
+            std::process::exit(1);
+        });
+    config.sync_to_legacy_env();
+    log::info!("loaded config:\n{}", config);
+    let port = config.id_server_port();
     if port < 3 {
         bail!("Invalid port");
     }
-    let rmem = get_arg("rmem").parse::<usize>().unwrap_or(RMEM);
-    let serial: i32 = get_arg("serial").parse().unwrap_or(0);
+    let rmem = config.relay.rmem;
+    let serial = config.rendezvous.serial;
     crate::common::check_software_update();
-    RendezvousServer::start(port, serial, &get_arg_or("key", "-".to_owned()), rmem)?;
+    RendezvousServer::start(port, serial, &config.server.key, rmem)?;
     Ok(())
 }
