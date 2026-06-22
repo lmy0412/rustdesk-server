@@ -9,15 +9,10 @@ pub struct VersionResponse {
 }
 
 pub async fn handle_version() -> Json<VersionResponse> {
-    let mut features = Vec::new();
-    if cfg!(feature = "pro") {
-        features.push("pro");
-    }
-
     Json(VersionResponse {
         version: crate::version::VERSION,
         rustc: option_env!("RUSTC_VERSION").unwrap_or("unknown"),
-        features,
+        features: vec!["pro"],
     })
 }
 
@@ -39,9 +34,6 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let Json(response) = rt.block_on(handle_version());
 
-        #[cfg(not(feature = "pro"))]
-        assert!(response.features.is_empty());
-        #[cfg(feature = "pro")]
         assert_eq!(response.features, vec!["pro"]);
     }
 }
