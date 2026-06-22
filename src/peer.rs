@@ -67,20 +67,7 @@ pub(crate) struct PeerMap {
 
 impl PeerMap {
     pub(crate) async fn new() -> ResultType<Self> {
-        let db = std::env::var("DB_URL").unwrap_or({
-            let mut db = "db_v2.sqlite3".to_owned();
-            #[cfg(all(windows, not(debug_assertions)))]
-            {
-                if let Some(path) = hbb_common::config::Config::icon_path().parent() {
-                    db = format!("{}\\{}", path.to_str().unwrap_or("."), db);
-                }
-            }
-            #[cfg(not(windows))]
-            {
-                db = format!("./{db}");
-            }
-            db
-        });
+        let db = selected_db_path(std::env::var("DB_URL").ok(), configured_db_path());
         log::info!("DB_URL={}", db);
         let pm = Self {
             map: Default::default(),
@@ -176,5 +163,77 @@ impl PeerMap {
     #[inline]
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
+    }
+}
+
+fn configured_db_path() -> Option<String> {
+    crate::config::global_config().and_then(|cfg_lock| {
+        let cfg = cfg_lock.read().ok()?;
+        let path = cfg.server.db_path.clone();
+        if path.is_empty() {
+            None
+        } else {
+            Some(path)
+        }
+    })
+}
+
+fn legacy_default_db_path() -> String {
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        let mut db = "db_v2.sqlite3".to_owned();
+        if let Some(path) = hbb_common::config::Config::icon_path().parent() {
+            db = format!("{}\\{}", path.to_str().unwrap_or("."), db);
+        }
+        db
+    }
+    #[cfg(all(windows, debug_assertions))]
+    {
+        "db_v2.sqlite3".to_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        "./db_v2.sqlite3".to_owned()
+    }
+}
+
+fn selected_db_path(db_url: Option<String>, configured: Option<String>) -> String {
+    db_url.or(configured).unwrap_or_else(legacy_default_db_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_db_path_is_legacy_compatible() {
+        assert_eq!(selected_db_path(None, None), legacy_default_db_path());
+    }
+
+    #[test]
+    fn test_config_db_path_is_used() {
+        assert_eq!(
+            selected_db_path(None, Some("custom.sqlite3".to_string())),
+            "custom.sqlite3"
+        );
+    }
+
+    #[test]
+    fn test_explicit_var_lib_db_path_is_used() {
+        assert_eq!(
+            selected_db_path(None, Some("/var/lib/rustdesk/db.sqlite3".to_string())),
+            "/var/lib/rustdesk/db.sqlite3"
+        );
+    }
+
+    #[test]
+    fn test_db_url_overrides_config_db_path() {
+        assert_eq!(
+            selected_db_path(
+                Some("env.sqlite3".to_string()),
+                Some("custom.sqlite3".to_string())
+            ),
+            "env.sqlite3"
+        );
     }
 }

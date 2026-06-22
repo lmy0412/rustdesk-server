@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use hbb_common::{log, ResultType};
 use sqlx::{
-    sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, SqliteConnection,
+    sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, Row,
+    SqliteConnection,
 };
 use std::{ops::DerefMut, str::FromStr};
 //use sqlx::postgres::PgPoolOptions;
@@ -35,7 +36,7 @@ pub struct Database {
     pool: Pool,
 }
 
-#[derive(Default)]
+#[derive(Default, sqlx::FromRow)]
 pub struct Peer {
     pub guid: Vec<u8>,
     pub id: String,
@@ -44,10 +45,20 @@ pub struct Peer {
     pub user: Option<Vec<u8>>,
     pub info: String,
     pub status: Option<i64>,
+    pub note: Option<String>,
+    pub owner_user_id: Option<i64>,
+    pub group_id: Option<i64>,
+    pub features: Option<String>,
+    pub token_version: i64,
 }
 
 impl Database {
     pub async fn new(url: &str) -> ResultType<Database> {
+        if let Some(parent) = std::path::Path::new(url).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).ok();
+            }
+        }
         if !std::path::Path::new(url).exists() {
             std::fs::File::create(url).ok();
         }
@@ -62,43 +73,41 @@ impl Database {
             },
             n,
         );
-        let _ = pool.get().await?; // test
+        let mut conn = pool.get().await?;
+        log::info!("Running database migrations...");
+        sqlx::migrate!().run(conn.deref_mut()).await?;
+        migrate_legacy_peer_if_exists(conn.deref_mut()).await?;
+        log::info!("Database migrations complete");
         let db = Database { pool };
-        db.create_tables().await?;
         Ok(db)
     }
 
+    #[allow(dead_code)]
     async fn create_tables(&self) -> ResultType<()> {
-        sqlx::query!(
-            "
-            create table if not exists peer (
-                guid blob primary key not null,
-                id varchar(100) not null,
-                uuid blob not null,
-                pk blob not null,
-                created_at datetime not null default(current_timestamp),
-                user blob,
-                status tinyint,
-                note varchar(300),
-                info text not null
-            ) without rowid;
-            create unique index if not exists index_peer_id on peer (id);
-            create index if not exists index_peer_user on peer (user);
-            create index if not exists index_peer_created_at on peer (created_at);
-            create index if not exists index_peer_status on peer (status);
-        "
-        )
-        .execute(self.pool.get().await?.deref_mut())
-        .await?;
         Ok(())
     }
 
     pub async fn get_peer(&self, id: &str) -> ResultType<Option<Peer>> {
-        Ok(sqlx::query_as!(
-            Peer,
-            "select guid, id, uuid, pk, user, status, info from peer where id = ?",
-            id
+        Ok(sqlx::query_as::<_, Peer>(
+            "
+            SELECT
+                guid,
+                device_id AS id,
+                uuid,
+                pk,
+                CAST(NULL AS BLOB) AS user,
+                info,
+                CAST(NULL AS INTEGER) AS status,
+                note,
+                owner_user_id,
+                group_id,
+                features,
+                token_version
+            FROM devices
+            WHERE device_id = ?
+            ",
         )
+        .bind(id)
         .fetch_optional(self.pool.get().await?.deref_mut())
         .await?)
     }
@@ -111,16 +120,14 @@ impl Database {
         info: &str,
     ) -> ResultType<Vec<u8>> {
         let guid = uuid::Uuid::new_v4().as_bytes().to_vec();
-        sqlx::query!(
-            "insert into peer(guid, id, uuid, pk, info) values(?, ?, ?, ?, ?)",
-            guid,
-            id,
-            uuid,
-            pk,
-            info
-        )
-        .execute(self.pool.get().await?.deref_mut())
-        .await?;
+        sqlx::query("INSERT INTO devices(guid, device_id, uuid, pk, info) VALUES(?, ?, ?, ?, ?)")
+            .bind(&guid)
+            .bind(id)
+            .bind(uuid)
+            .bind(pk)
+            .bind(info)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
         Ok(guid)
     }
 
@@ -131,51 +138,438 @@ impl Database {
         pk: &[u8],
         info: &str,
     ) -> ResultType<()> {
-        sqlx::query!(
-            "update peer set id=?, pk=?, info=? where guid=?",
-            id,
-            pk,
-            info,
-            guid
-        )
-        .execute(self.pool.get().await?.deref_mut())
-        .await?;
+        sqlx::query("UPDATE devices SET device_id=?, pk=?, info=? WHERE guid=?")
+            .bind(id)
+            .bind(pk)
+            .bind(info)
+            .bind(guid)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
         Ok(())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use hbb_common::tokio;
-    #[test]
-    fn test_insert() {
-        insert();
+async fn migrate_legacy_peer_if_exists(conn: &mut SqliteConnection) -> ResultType<()> {
+    let peer_exists = fetch_count(
+        conn,
+        "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name='peer'",
+    )
+    .await?
+        > 0;
+    if !peer_exists {
+        return Ok(());
     }
 
-    #[tokio::main(flavor = "multi_thread")]
-    async fn insert() {
-        let db = super::Database::new("test.sqlite3").await.unwrap();
-        let mut jobs = vec![];
-        for i in 0..10000 {
-            let cloned = db.clone();
-            let id = i.to_string();
-            let a = tokio::spawn(async move {
-                let empty_vec = Vec::new();
-                cloned
-                    .insert_peer(&id, &empty_vec, &empty_vec, "")
+    let devices_count = fetch_count(conn, "SELECT COUNT(*) AS count FROM devices").await?;
+    if devices_count > 0 {
+        log::info!(
+            "Legacy peer migration skipped: devices already contains {} rows",
+            devices_count
+        );
+        return Ok(());
+    }
+
+    let mut tx = conn.begin().await?;
+    let affected = sqlx::query(
+        "
+        INSERT INTO devices (guid, uuid, pk, device_id, note, info, created_at)
+        SELECT
+            guid,
+            uuid,
+            pk,
+            id AS device_id,
+            CASE WHEN note IS NULL OR note = '' THEN NULL ELSE note END,
+            info,
+            COALESCE(created_at, current_timestamp)
+        FROM peer
+        ",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("ALTER TABLE peer RENAME TO peer_backup_legacy")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    log::info!(
+        "Migrated {} rows from peer to devices; old table renamed to peer_backup_legacy",
+        affected.rows_affected()
+    );
+    Ok(())
+}
+
+async fn fetch_count(conn: &mut SqliteConnection, sql: &str) -> ResultType<i64> {
+    let row = sqlx::query(sql).fetch_one(&mut *conn).await?;
+    Ok(row.try_get::<i64, _>("count")?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hbb_common::tokio;
+    use sqlx::{Connection, Executor, SqliteConnection};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const TEST_GUID: &[u8] = b"guid-binary-0001";
+    const TEST_UUID: &[u8] = b"uuid-binary-0001";
+    const TEST_PK: &[u8] = b"pk-binary-0001";
+
+    #[test]
+    fn test_new_database_schema() {
+        run(async {
+            let path = temp_db_path("new-schema");
+            let db = Database::new(&path).await.unwrap();
+
+            for table in [
+                "devices",
+                "users",
+                "groups",
+                "licenses",
+                "audit_logs",
+                "_sqlx_migrations",
+            ] {
+                assert!(
+                    table_exists(&db, table).await.unwrap(),
+                    "{table} should exist"
+                );
+            }
+
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_migrate_peer_to_devices() {
+        run(async {
+            let path = temp_db_path("migrate-peer");
+            create_legacy_peer_db(&path, true).await.unwrap();
+            insert_legacy_peer(&path, "device-a", Some("hello"))
+                .await
+                .unwrap();
+
+            let db = Database::new(&path).await.unwrap();
+
+            assert_eq!(count(&db, "SELECT COUNT(*) AS count FROM devices").await, 1);
+            assert!(table_exists(&db, "peer_backup_legacy").await.unwrap());
+            assert!(!table_exists(&db, "peer").await.unwrap());
+
+            let peer = db.get_peer("device-a").await.unwrap().unwrap();
+            assert_eq!(peer.guid, TEST_GUID);
+            assert_eq!(peer.uuid, TEST_UUID);
+            assert_eq!(peer.pk, TEST_PK);
+            assert_eq!(peer.id, "device-a");
+            assert_eq!(peer.note.as_deref(), Some("hello"));
+            assert_eq!(peer.info, "{\"ip\":\"127.0.0.1\"}");
+
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_migrate_guid_uuid_pk_blob() {
+        run(async {
+            let path = temp_db_path("migrate-blob");
+            create_legacy_peer_db(&path, true).await.unwrap();
+            insert_legacy_peer(&path, "device-blob", Some("blob-note"))
+                .await
+                .unwrap();
+
+            let db = Database::new(&path).await.unwrap();
+            let mut conn = db.pool.get().await.unwrap();
+            let row = sqlx::query(
+                "SELECT typeof(guid) AS guid_type, typeof(uuid) AS uuid_type, typeof(pk) AS pk_type FROM devices WHERE device_id = ?",
+            )
+            .bind("device-blob")
+            .fetch_one(conn.deref_mut())
+            .await
+            .unwrap();
+
+            assert_eq!(row.try_get::<String, _>("guid_type").unwrap(), "blob");
+            assert_eq!(row.try_get::<String, _>("uuid_type").unwrap(), "blob");
+            assert_eq!(row.try_get::<String, _>("pk_type").unwrap(), "blob");
+
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_migrate_note_field() {
+        run(async {
+            let path = temp_db_path("migrate-note");
+            create_legacy_peer_db(&path, true).await.unwrap();
+            insert_legacy_peer(&path, "device-note", Some("note-value"))
+                .await
+                .unwrap();
+
+            let db = Database::new(&path).await.unwrap();
+            let peer = db.get_peer("device-note").await.unwrap().unwrap();
+
+            assert_eq!(peer.note.as_deref(), Some("note-value"));
+
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_migrate_idempotent() {
+        run(async {
+            let path = temp_db_path("migrate-idempotent");
+            create_legacy_peer_db(&path, true).await.unwrap();
+            insert_legacy_peer(&path, "device-idempotent", None)
+                .await
+                .unwrap();
+
+            let db = Database::new(&path).await.unwrap();
+            assert_eq!(count(&db, "SELECT COUNT(*) AS count FROM devices").await, 1);
+            drop(db);
+
+            let db = Database::new(&path).await.unwrap();
+            assert_eq!(count(&db, "SELECT COUNT(*) AS count FROM devices").await, 1);
+
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_migrate_transaction_rollback() {
+        run(async {
+            let path = temp_db_path("migrate-rollback");
+            create_legacy_peer_db(&path, false).await.unwrap();
+            insert_invalid_legacy_peer(&path).await.unwrap();
+
+            let err = Database::new(&path).await.err().unwrap();
+            assert!(err.to_string().contains("NOT NULL") || err.to_string().contains("pk"));
+
+            let mut conn = connect(&path).await.unwrap();
+            assert!(raw_table_exists(&mut conn, "peer").await.unwrap());
+            assert!(!raw_table_exists(&mut conn, "peer_backup_legacy")
+                .await
+                .unwrap());
+            assert_eq!(
+                raw_count(&mut conn, "SELECT COUNT(*) AS count FROM peer")
                     .await
-                    .unwrap();
-            });
-            jobs.push(a);
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                raw_count(&mut conn, "SELECT COUNT(*) AS count FROM devices")
+                    .await
+                    .unwrap(),
+                0
+            );
+
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_get_peer_after_migration() {
+        run(async {
+            let path = temp_db_path("get-peer-after-migration");
+            create_legacy_peer_db(&path, true).await.unwrap();
+            insert_legacy_peer(&path, "device-get", None).await.unwrap();
+
+            let db = Database::new(&path).await.unwrap();
+            let peer = db.get_peer("device-get").await.unwrap().unwrap();
+
+            assert_eq!(peer.id, "device-get");
+            assert_eq!(peer.pk, TEST_PK);
+
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_insert_peer_to_devices() {
+        run(async {
+            let path = temp_db_path("insert-peer");
+            let db = Database::new(&path).await.unwrap();
+
+            let guid = db
+                .insert_peer("new-device", TEST_UUID, TEST_PK, "{\"ip\":\"10.0.0.1\"}")
+                .await
+                .unwrap();
+            let peer = db.get_peer("new-device").await.unwrap().unwrap();
+
+            assert_eq!(peer.guid, guid);
+            assert_eq!(peer.uuid, TEST_UUID);
+            assert_eq!(peer.pk, TEST_PK);
+
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_update_pk_to_devices() {
+        run(async {
+            let path = temp_db_path("update-peer");
+            let db = Database::new(&path).await.unwrap();
+
+            let guid = db
+                .insert_peer("before-update", TEST_UUID, TEST_PK, "{\"ip\":\"10.0.0.1\"}")
+                .await
+                .unwrap();
+            let new_pk = b"new-pk-binary";
+            db.update_pk(&guid, "after-update", new_pk, "{\"ip\":\"10.0.0.2\"}")
+                .await
+                .unwrap();
+
+            assert!(db.get_peer("before-update").await.unwrap().is_none());
+            let peer = db.get_peer("after-update").await.unwrap().unwrap();
+            assert_eq!(peer.guid, guid);
+            assert_eq!(peer.pk, new_pk);
+            assert_eq!(peer.info, "{\"ip\":\"10.0.0.2\"}");
+
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_insert() {
+        run(async {
+            let path = temp_db_path("concurrent-insert");
+            let db = Database::new(&path).await.unwrap();
+            let mut jobs = vec![];
+            for i in 0..10000 {
+                let cloned = db.clone();
+                let id = i.to_string();
+                let a = tokio::spawn(async move {
+                    cloned
+                        .insert_peer(&id, TEST_UUID, TEST_PK, "{}")
+                        .await
+                        .unwrap();
+                });
+                jobs.push(a);
+            }
+            for i in 0..10000 {
+                let cloned = db.clone();
+                let id = i.to_string();
+                let a = tokio::spawn(async move {
+                    cloned.get_peer(&id).await.unwrap();
+                });
+                jobs.push(a);
+            }
+            hbb_common::futures::future::join_all(jobs).await;
+
+            cleanup(&path);
+        });
+    }
+
+    fn run<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        tokio::runtime::Runtime::new().unwrap().block_on(future);
+    }
+
+    fn temp_db_path(name: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("rustdesk-{name}-{nanos}.sqlite3"))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    fn cleanup(path: &str) {
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(format!("{path}-shm")).ok();
+        std::fs::remove_file(format!("{path}-wal")).ok();
+    }
+
+    async fn connect(path: &str) -> ResultType<SqliteConnection> {
+        if !std::path::Path::new(path).exists() {
+            std::fs::File::create(path).ok();
         }
-        for i in 0..10000 {
-            let cloned = db.clone();
-            let id = i.to_string();
-            let a = tokio::spawn(async move {
-                cloned.get_peer(&id).await.unwrap();
-            });
-            jobs.push(a);
-        }
-        hbb_common::futures::future::join_all(jobs).await;
+        Ok(SqliteConnection::connect(path).await?)
+    }
+
+    async fn create_legacy_peer_db(path: &str, strict_not_null: bool) -> ResultType<()> {
+        let mut conn = connect(path).await?;
+        let pk_definition = if strict_not_null {
+            "pk BLOB NOT NULL"
+        } else {
+            "pk BLOB"
+        };
+        let sql = format!(
+            "
+            CREATE TABLE peer (
+                guid BLOB PRIMARY KEY NOT NULL,
+                id VARCHAR(100) NOT NULL,
+                uuid BLOB NOT NULL,
+                {pk_definition},
+                created_at DATETIME NOT NULL DEFAULT (current_timestamp),
+                user BLOB,
+                status TINYINT,
+                note VARCHAR(300),
+                info TEXT NOT NULL
+            ) WITHOUT ROWID
+            "
+        );
+        conn.execute(sql.as_str()).await?;
+        Ok(())
+    }
+
+    async fn insert_legacy_peer(path: &str, device_id: &str, note: Option<&str>) -> ResultType<()> {
+        let mut conn = connect(path).await?;
+        sqlx::query(
+            "
+            INSERT INTO peer(guid, id, uuid, pk, note, info)
+            VALUES(?, ?, ?, ?, ?, ?)
+            ",
+        )
+        .bind(TEST_GUID)
+        .bind(device_id)
+        .bind(TEST_UUID)
+        .bind(TEST_PK)
+        .bind(note)
+        .bind("{\"ip\":\"127.0.0.1\"}")
+        .execute(&mut conn)
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_invalid_legacy_peer(path: &str) -> ResultType<()> {
+        let mut conn = connect(path).await?;
+        sqlx::query(
+            "
+            INSERT INTO peer(guid, id, uuid, pk, note, info)
+            VALUES(?, ?, ?, NULL, ?, ?)
+            ",
+        )
+        .bind(TEST_GUID)
+        .bind("broken-device")
+        .bind(TEST_UUID)
+        .bind("bad-note")
+        .bind("{\"ip\":\"127.0.0.1\"}")
+        .execute(&mut conn)
+        .await?;
+        Ok(())
+    }
+
+    async fn table_exists(db: &Database, table: &str) -> ResultType<bool> {
+        let mut conn = db.pool.get().await?;
+        raw_table_exists(conn.deref_mut(), table).await
+    }
+
+    async fn raw_table_exists(conn: &mut SqliteConnection, table: &str) -> ResultType<bool> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name=?",
+        )
+        .bind(table)
+        .fetch_one(conn)
+        .await?;
+        Ok(row.try_get::<i64, _>("count")? > 0)
+    }
+
+    async fn count(db: &Database, sql: &str) -> i64 {
+        let mut conn = db.pool.get().await.unwrap();
+        raw_count(conn.deref_mut(), sql).await.unwrap()
+    }
+
+    async fn raw_count(conn: &mut SqliteConnection, sql: &str) -> ResultType<i64> {
+        let row = sqlx::query(sql).fetch_one(conn).await?;
+        Ok(row.try_get::<i64, _>("count")?)
     }
 }

@@ -29,7 +29,22 @@ fn default_key_file() -> String {
     "/var/lib/rustdesk/id_ed25519".to_string()
 }
 fn default_db_path() -> String {
-    "/var/lib/rustdesk/db.sqlite3".to_string()
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        let mut db = "db_v2.sqlite3".to_owned();
+        if let Some(path) = hbb_common::config::Config::icon_path().parent() {
+            db = format!("{}\\{}", path.to_str().unwrap_or("."), db);
+        }
+        db
+    }
+    #[cfg(all(windows, debug_assertions))]
+    {
+        "db_v2.sqlite3".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        "./db_v2.sqlite3".to_string()
+    }
 }
 fn default_rendezvous_servers() -> Vec<String> {
     Vec::new()
@@ -1195,6 +1210,7 @@ mod tests {
         assert_eq!(cfg.server.id_server, "0.0.0.0:21116");
         assert_eq!(cfg.server.relay_server, "0.0.0.0:21117");
         assert_eq!(cfg.server.api_server, "0.0.0.0:21114");
+        assert_eq!(cfg.server.db_path, default_db_path());
         assert_eq!(cfg.server.key, "-");
         assert_eq!(cfg.rendezvous.serial, 0);
         assert!(cfg.rendezvous.servers.is_empty());
