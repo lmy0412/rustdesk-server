@@ -33,7 +33,7 @@ base64 = "0.13"
 axum = { version = "0.5", features = ["headers"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tower = { version = "0.4", features = ["util"] }
-sqlx = { version = "0.6", features = [ "runtime-tokio-rustls", "sqlite", "macros", "chrono", "json" ] }
+sqlx = { version = "0.6", features = [ "runtime-tokio-rustls", "sqlite", "macros", "migrate", "chrono", "json" ] }
 deadpool = "0.8"
 async-trait = "0.1"
 async-speed-limit = { git = "https://github.com/open-trade/async-speed-limit" }
