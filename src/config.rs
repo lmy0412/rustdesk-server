@@ -25,6 +25,15 @@ fn default_relay_server() -> String {
 fn default_api_server() -> String {
     "0.0.0.0:21114".to_string()
 }
+fn default_jwt_secret() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+fn default_jwt_expiry_hours() -> i64 {
+    24
+}
+fn default_refresh_expiry_days() -> i64 {
+    7
+}
 fn default_key_file() -> String {
     "/var/lib/rustdesk/id_ed25519".to_string()
 }
@@ -140,6 +149,13 @@ pub struct ProConfig {
     pub tls_cert: String,
     #[serde(default = "default_tls_key")]
     pub tls_key: String,
+    /// 敏感字段：日志输出时必须脱敏。
+    #[serde(default = "default_jwt_secret")]
+    pub jwt_secret: String,
+    #[serde(default = "default_jwt_expiry_hours")]
+    pub jwt_expiry_hours: i64,
+    #[serde(default = "default_refresh_expiry_days")]
+    pub refresh_expiry_days: i64,
     #[serde(default)]
     pub oidc: OidcConfig,
     #[serde(default)]
@@ -163,6 +179,9 @@ impl Default for ProConfig {
             web_port: default_web_port(),
             tls_cert: default_tls_cert(),
             tls_key: default_tls_key(),
+            jwt_secret: default_jwt_secret(),
+            jwt_expiry_hours: default_jwt_expiry_hours(),
+            refresh_expiry_days: default_refresh_expiry_days(),
             oidc: OidcConfig::default(),
             smtp: SmtpConfig::default(),
         }
@@ -410,8 +429,16 @@ impl fmt::Display for ProConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ProConfig {{ enabled: {}, web_port: {}, tls_cert: {}, tls_key: {}, oidc: {}, smtp: {} }}",
-            self.enabled, self.web_port, self.tls_cert, self.tls_key, self.oidc, self.smtp
+            "ProConfig {{ enabled: {}, web_port: {}, tls_cert: {}, tls_key: {}, jwt_secret: {}, jwt_expiry_hours: {}, refresh_expiry_days: {}, oidc: {}, smtp: {} }}",
+            self.enabled,
+            self.web_port,
+            self.tls_cert,
+            self.tls_key,
+            mask_sensitive(&self.jwt_secret),
+            self.jwt_expiry_hours,
+            self.refresh_expiry_days,
+            self.oidc,
+            self.smtp
         )
     }
 }
@@ -989,6 +1016,15 @@ fn validate_config(cfg: &AppConfig) -> Result<(), String> {
     checked_listen_port("server.id_server", &cfg.server.id_server)?;
     checked_listen_port("server.relay_server", &cfg.server.relay_server)?;
     checked_listen_port("server.api_server", &cfg.server.api_server)?;
+    if cfg.pro.jwt_secret.trim().len() < 32 {
+        return Err("pro.jwt_secret must be at least 32 characters".to_string());
+    }
+    if cfg.pro.jwt_expiry_hours <= 0 {
+        return Err("pro.jwt_expiry_hours must be positive".to_string());
+    }
+    if cfg.pro.refresh_expiry_days <= 0 {
+        return Err("pro.refresh_expiry_days must be positive".to_string());
+    }
     Ok(())
 }
 
@@ -1177,6 +1213,24 @@ fn diff_fields(old: &AppConfig, new: &AppConfig) -> Vec<String> {
         &old.pro.tls_key,
         &new.pro.tls_key,
     );
+    push_diff(
+        &mut fields,
+        "pro.jwt_secret",
+        &old.pro.jwt_secret,
+        &new.pro.jwt_secret,
+    );
+    push_diff(
+        &mut fields,
+        "pro.jwt_expiry_hours",
+        &old.pro.jwt_expiry_hours,
+        &new.pro.jwt_expiry_hours,
+    );
+    push_diff(
+        &mut fields,
+        "pro.refresh_expiry_days",
+        &old.pro.refresh_expiry_days,
+        &new.pro.refresh_expiry_days,
+    );
     push_diff(&mut fields, "pro.oidc", &old.pro.oidc, &new.pro.oidc);
     push_diff(&mut fields, "pro.smtp", &old.pro.smtp, &new.pro.smtp);
     fields
@@ -1218,6 +1272,9 @@ mod tests {
         assert_eq!(cfg.relay.max_single_bandwidth, 128);
         assert_eq!(cfg.relay.max_total_bandwidth, 1024);
         assert!(!cfg.pro.enabled);
+        assert_eq!(cfg.pro.jwt_expiry_hours, 24);
+        assert_eq!(cfg.pro.refresh_expiry_days, 7);
+        assert!(!cfg.pro.jwt_secret.is_empty());
     }
 
     #[test]
@@ -1290,6 +1347,15 @@ mod tests {
         cfg.pro.smtp.password = "smtp-pass".to_string();
         let output = format!("{}", cfg.pro.smtp);
         assert!(!output.contains("smtp-pass"));
+        assert!(output.contains("***"));
+    }
+
+    #[test]
+    fn test_display_masks_jwt_secret() {
+        let mut cfg = AppConfig::default();
+        cfg.pro.jwt_secret = "jwt-secret".to_string();
+        let output = format!("{}", cfg.pro);
+        assert!(!output.contains("jwt-secret"));
         assert!(output.contains("***"));
     }
 
@@ -1453,6 +1519,36 @@ max_total_bandwidth = 1024
             .unwrap_err();
         assert!(err.contains("TOML") || err.contains("syntax") || err.contains("invalid"));
         assert_eq!(old.server.id_server, default_id_server());
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_empty_jwt_secret_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_test_env();
+        let path = temp_config(
+            r#"
+[pro]
+jwt_secret = ""
+"#,
+        );
+        let err = AppConfig::load_from_path(Some(&path), ConfigTarget::Hbbs).unwrap_err();
+        assert!(err.contains("pro.jwt_secret"));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_short_jwt_secret_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_test_env();
+        let path = temp_config(
+            r#"
+[pro]
+jwt_secret = "short"
+"#,
+        );
+        let err = AppConfig::load_from_path(Some(&path), ConfigTarget::Hbbs).unwrap_err();
+        assert!(err.contains("pro.jwt_secret"));
         fs::remove_file(path).ok();
     }
 
@@ -1674,6 +1770,9 @@ id_server = "127.0.0.1:21116"
             "RUSTDESK_SERVER__ID_SERVER",
             "RUSTDESK_SERVER__RELAY_SERVER",
             "RUSTDESK_SERVER__KEY",
+            "RUSTDESK_PRO__JWT_SECRET",
+            "RUSTDESK_PRO__JWT_EXPIRY_HOURS",
+            "RUSTDESK_PRO__REFRESH_EXPIRY_DAYS",
             "RUSTDESK_RENDEZVOUS__SERVERS",
             "RUSTDESK_RELAY__SERVERS",
         ] {

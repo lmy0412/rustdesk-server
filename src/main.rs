@@ -4,6 +4,7 @@
 use flexi_logger::*;
 use hbb_common::{bail, config::RENDEZVOUS_PORT, log, ResultType};
 use hbbs::api;
+use hbbs::auth::AuthState;
 use hbbs::config::{AppConfig, ConfigTarget};
 use hbbs::{common::*, *};
 
@@ -43,8 +44,10 @@ fn main() -> ResultType<()> {
         std::process::exit(1);
     });
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let db_url = config.server.db_path.clone();
+    let auth_state = AuthState::from_config(&config.pro);
     let _api_thread = std::thread::spawn(move || {
-        api::api_server_forever(api_addr, ready_tx);
+        api::api_server_forever(api_addr, ready_tx, db_url, auth_state);
     });
     match ready_rx.recv() {
         Ok(Ok(())) => {
