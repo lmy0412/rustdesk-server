@@ -1,0 +1,13 @@
+[pro]
+enabled = false
+
+[pro.oidc]
+enabled = false
+issuer_url = ""
+client_id = ""
+client_secret = ""
+redirect_uri = ""
+post_login_url = ""
+allowed_origins = [
+    # "https://console.example.com",
+]
