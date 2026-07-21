@@ -169,6 +169,9 @@ mod tests {
             role: "admin".to_string(),
             is_active: true,
             token_version: 3,
+            oauth_provider: None,
+            oauth_subject: None,
+            last_login_at: None,
             created_at: epoch(),
             updated_at: epoch(),
         }

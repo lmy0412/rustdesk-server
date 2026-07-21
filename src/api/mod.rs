@@ -2,10 +2,11 @@ pub mod admin_init;
 pub mod auth;
 pub mod health;
 pub mod middleware;
+pub mod oidc;
 pub mod users;
 pub mod version;
 
-use crate::{auth::AuthState, database::Database};
+use crate::{auth::AuthState, config::OidcConfig, database::Database};
 use axum::{
     http::StatusCode,
     routing::{any, get, post},
@@ -16,7 +17,7 @@ use serde_json::{json, Value};
 use std::{net::SocketAddr, sync::mpsc::Sender};
 use tower::ServiceBuilder;
 
-pub fn build_router(db: Database, auth_state: AuthState) -> Router {
+pub fn build_router(db: Database, auth_state: AuthState, oidc_config: OidcConfig) -> Router {
     let protected_router = Router::new()
         .route("/api/auth/logout", post(auth::handle_logout))
         .route(
@@ -33,24 +34,28 @@ pub fn build_router(db: Database, auth_state: AuthState) -> Router {
             ServiceBuilder::new()
                 .layer(Extension(db.clone()))
                 .layer(Extension(auth_state.clone()))
+                .layer(Extension(oidc_config.clone()))
                 .layer(axum::middleware::from_fn(middleware::auth_layer)),
         );
 
     Router::new()
         .route("/api/auth/login", post(auth::handle_login))
         .route("/api/auth/refresh", post(auth::handle_refresh))
+        .route("/api/auth/oidc/login", get(oidc::handle_oidc_login))
+        .route("/api/auth/oidc/callback", get(oidc::handle_oidc_callback))
         .route("/api/health", get(health::handle_health))
         .route("/api/version", get(version::handle_version))
         .merge(protected_router)
         .layer(
             ServiceBuilder::new()
                 .layer(Extension(db))
-                .layer(Extension(auth_state)),
+                .layer(Extension(auth_state))
+                .layer(Extension(oidc_config.clone())),
         )
         .fallback(any(handle_404))
         .layer(middleware::rate_limit_layer())
         .layer(axum::middleware::from_fn(middleware::request_logger))
-        .layer(middleware::cors_middleware())
+        .layer(middleware::cors_middleware(&oidc_config))
 }
 
 pub fn api_server_forever(
@@ -58,6 +63,7 @@ pub fn api_server_forever(
     ready_tx: Sender<Result<(), String>>,
     db_url: String,
     auth_state: AuthState,
+    oidc_config: OidcConfig,
 ) {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -86,7 +92,7 @@ pub fn api_server_forever(
             std::process::exit(1);
         }
 
-        let app = build_router(db, auth_state);
+        let app = build_router(db, auth_state, oidc_config);
         log::info!("API server binding to {}", addr);
         match axum::Server::try_bind(&addr) {
             Ok(server) => {
@@ -130,7 +136,7 @@ mod tests {
         rt.block_on(async {
             let path = temp_db_path("api-build-router");
             let db = Database::new(&path).await.unwrap();
-            let _app = build_router(db, test_auth_state());
+            let _app = build_router(db, test_auth_state(), test_oidc_config());
             cleanup(&path);
         });
     }
@@ -141,7 +147,7 @@ mod tests {
         rt.block_on(async {
             let path = temp_db_path("api-health");
             let db = Database::new(&path).await.unwrap();
-            let response = build_router(db, test_auth_state())
+            let response = build_router(db, test_auth_state(), test_oidc_config())
                 .oneshot(
                     Request::builder()
                         .uri("/api/health")
@@ -165,7 +171,7 @@ mod tests {
         rt.block_on(async {
             let path = temp_db_path("api-404");
             let db = Database::new(&path).await.unwrap();
-            let response = build_router(db, test_auth_state())
+            let response = build_router(db, test_auth_state(), test_oidc_config())
                 .oneshot(
                     Request::builder()
                         .uri("/api/does-not-exist")
@@ -194,7 +200,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let app = build_router(db, test_auth_state());
+            let app = build_router(db, test_auth_state(), test_oidc_config());
             let login_response = app
                 .clone()
                 .oneshot(json_request(
@@ -275,6 +281,303 @@ mod tests {
         });
     }
 
+    #[test]
+    fn test_refresh_with_cookie_and_empty_body() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("api-cookie-refresh");
+            let db = Database::new(&path).await.unwrap();
+            let password_hash = admin_init::hash_password("secret").unwrap();
+            db.create_user("admin", &password_hash, None, "admin")
+                .await
+                .unwrap();
+
+            let app = build_router(db, test_auth_state(), test_oidc_config());
+            let cookie_header = login_cookie_header(&app).await;
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/auth/refresh")
+                        .header(header::COOKIE, cookie_header)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value =
+                serde_json::from_slice(&read_body(response.into_body()).await).unwrap();
+            assert!(body["access_token"].as_str().is_some());
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_refresh_cookie_csrf_missing_origin_returns_403() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (app, cookie_header, path) = app_with_cross_origin_cookie().await;
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/auth/refresh")
+                        .header(header::COOKIE, cookie_header)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_refresh_cookie_csrf_allowed_origin_passes() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (app, cookie_header, path) = app_with_cross_origin_cookie().await;
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/auth/refresh")
+                        .header(header::COOKIE, cookie_header)
+                        .header(header::ORIGIN, "https://console.example.com")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_refresh_cookie_csrf_invalid_origin_returns_403() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (app, cookie_header, path) = app_with_cross_origin_cookie().await;
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/auth/refresh")
+                        .header(header::COOKIE, cookie_header)
+                        .header(header::ORIGIN, "https://evil.example.com")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_cookie_csrf_missing_origin_returns_403() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (app, cookie_header, path) = app_with_cross_origin_cookie().await;
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/auth/logout")
+                        .header(header::COOKIE, cookie_header)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_cookie_csrf_allowed_origin_passes() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (app, cookie_header, path) = app_with_cross_origin_cookie().await;
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/auth/logout")
+                        .header(header::COOKIE, cookie_header)
+                        .header(header::ORIGIN, "https://console.example.com")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_cookie_csrf_invalid_origin_returns_403() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (app, cookie_header, path) = app_with_cross_origin_cookie().await;
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/auth/logout")
+                        .header(header::COOKIE, cookie_header)
+                        .header(header::ORIGIN, "https://evil.example.com")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_oidc_login_not_configured() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("api-oidc-login-not-configured");
+            let db = Database::new(&path).await.unwrap();
+            let response = build_router(db, test_auth_state(), test_oidc_config())
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/api/auth/oidc/login")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body: Value =
+                serde_json::from_slice(&read_body(response.into_body()).await).unwrap();
+            assert_eq!(body, json!({ "error": "OIDC not configured" }));
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_oidc_callback_not_configured_redirects() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("api-oidc-callback-not-configured");
+            let db = Database::new(&path).await.unwrap();
+            let oidc_config = OidcConfig {
+                post_login_url: "https://console.example.com/dashboard".to_string(),
+                ..OidcConfig::default()
+            };
+            let response = build_router(db, test_auth_state(), oidc_config)
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/api/auth/oidc/callback")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::FOUND);
+            assert_eq!(
+                response.headers().get(header::LOCATION).unwrap(),
+                "https://console.example.com/dashboard?error=oidc_not_configured"
+            );
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_oidc_callback_missing_params() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("api-oidc-callback-missing-params");
+            let db = Database::new(&path).await.unwrap();
+            let response = build_router(db, test_auth_state(), test_configured_oidc_config())
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/api/auth/oidc/callback")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_oidc_redirect(&response, "invalid_request");
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_oidc_callback_invalid_state() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("api-oidc-callback-invalid-state");
+            let db = Database::new(&path).await.unwrap();
+            let response = build_router(db, test_auth_state(), test_configured_oidc_config())
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/api/auth/oidc/callback?code=abc&state=missing")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_oidc_redirect(&response, "expired_session");
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_oidc_callback_expired_state() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("api-oidc-callback-expired-state");
+            let db = Database::new(&path).await.unwrap();
+            let state = unique_name("expired-state");
+            crate::auth::OIDC_SESSIONS.insert_expired(
+                state.clone(),
+                "verifier".to_string(),
+                "nonce".to_string(),
+            );
+            let uri = format!("/api/auth/oidc/callback?code=abc&state={state}");
+            let response = build_router(db, test_auth_state(), test_configured_oidc_config())
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_oidc_redirect(&response, "expired_session");
+            cleanup(&path);
+        });
+    }
+
     async fn read_body<B>(mut body: B) -> Vec<u8>
     where
         B: HttpBody<Data = Bytes> + Unpin,
@@ -295,6 +598,76 @@ mod tests {
         }
     }
 
+    fn test_oidc_config() -> OidcConfig {
+        OidcConfig::default()
+    }
+
+    fn test_cross_origin_oidc_config() -> OidcConfig {
+        OidcConfig {
+            allowed_origins: vec!["https://console.example.com".to_string()],
+            ..OidcConfig::default()
+        }
+    }
+
+    fn test_configured_oidc_config() -> OidcConfig {
+        OidcConfig {
+            enabled: true,
+            issuer_url: "https://issuer.example.com".to_string(),
+            client_id: "rustdesk-server".to_string(),
+            client_secret: "secret".to_string(),
+            redirect_uri: "https://server.example.com/api/auth/oidc/callback".to_string(),
+            post_login_url: "https://console.example.com/dashboard".to_string(),
+            allowed_origins: Vec::new(),
+        }
+    }
+
+    fn assert_oidc_redirect(response: &axum::response::Response, error: &str) {
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            &format!("https://console.example.com/dashboard?error={error}")
+        );
+    }
+
+    async fn app_with_cross_origin_cookie() -> (Router, String, String) {
+        let path = temp_db_path("api-cookie-csrf");
+        let db = Database::new(&path).await.unwrap();
+        let password_hash = admin_init::hash_password("secret").unwrap();
+        db.create_user("admin", &password_hash, None, "admin")
+            .await
+            .unwrap();
+        let app = build_router(db, test_auth_state(), test_cross_origin_oidc_config());
+        let cookie_header = login_cookie_header(&app).await;
+        (app, cookie_header, path)
+    }
+
+    async fn login_cookie_header(app: &Router) -> String {
+        let login_response = app
+            .clone()
+            .oneshot(json_request(
+                "/api/auth/login",
+                json!({ "username": "admin", "password": "secret" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(login_response.status(), StatusCode::OK);
+        login_response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
     fn json_request(uri: &str, value: Value) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -305,14 +678,21 @@ mod tests {
     }
 
     fn temp_db_path(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "{}.sqlite3",
+                unique_name(&format!("rustdesk-{name}"))
+            ))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    fn unique_name(prefix: &str) -> String {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir()
-            .join(format!("rustdesk-{name}-{nanos}.sqlite3"))
-            .to_string_lossy()
-            .to_string()
+        format!("{}-{}-{}", prefix, std::process::id(), nanos)
     }
 
     fn cleanup(path: &str) {

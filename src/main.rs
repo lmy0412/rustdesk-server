@@ -46,8 +46,9 @@ fn main() -> ResultType<()> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let db_url = config.server.db_path.clone();
     let auth_state = AuthState::from_config(&config.pro);
+    let oidc_config = config.pro.oidc.clone();
     let _api_thread = std::thread::spawn(move || {
-        api::api_server_forever(api_addr, ready_tx, db_url, auth_state);
+        api::api_server_forever(api_addr, ready_tx, db_url, auth_state, oidc_config);
     });
     match ready_rx.recv() {
         Ok(Ok(())) => {

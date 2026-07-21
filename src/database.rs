@@ -10,6 +10,7 @@ use std::{ops::DerefMut, str::FromStr};
 //use sqlx::mysql::MySqlPoolOptions;
 
 type Pool = deadpool::managed::Pool<DbPool>;
+const USER_COLUMNS: &str = "id, username, password_hash, email, role, is_active, token_version, oauth_provider, oauth_subject, last_login_at, created_at, updated_at";
 
 pub struct DbPool {
     url: String,
@@ -170,7 +171,7 @@ impl Database {
             "
             INSERT INTO users(username, password_hash, email, role)
             VALUES(?, ?, ?, ?)
-            RETURNING id, username, password_hash, email, role, is_active, token_version, created_at, updated_at
+            RETURNING id, username, password_hash, email, role, is_active, token_version, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
             ",
         )
         .bind(username)
@@ -184,7 +185,7 @@ impl Database {
     pub async fn find_user_by_id(&self, id: i64) -> ResultType<Option<User>> {
         Ok(sqlx::query_as::<_, User>(
             "
-            SELECT id, username, password_hash, email, role, is_active, token_version, created_at, updated_at
+            SELECT id, username, password_hash, email, role, is_active, token_version, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
             FROM users
             WHERE id = ?
             ",
@@ -197,7 +198,7 @@ impl Database {
     pub async fn find_user_by_username(&self, username: &str) -> ResultType<Option<User>> {
         Ok(sqlx::query_as::<_, User>(
             "
-            SELECT id, username, password_hash, email, role, is_active, token_version, created_at, updated_at
+            SELECT id, username, password_hash, email, role, is_active, token_version, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
             FROM users
             WHERE username = ?
             ",
@@ -214,7 +215,7 @@ impl Database {
 
         let users = sqlx::query_as::<_, User>(
             "
-            SELECT id, username, password_hash, email, role, is_active, token_version, created_at, updated_at
+            SELECT id, username, password_hash, email, role, is_active, token_version, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
             FROM users
             ORDER BY id
             LIMIT ? OFFSET ?
@@ -227,6 +228,96 @@ impl Database {
 
         let total = self.count_users().await?;
         Ok((users, total))
+    }
+
+    pub async fn find_users_by_email(&self, email: &str) -> ResultType<Vec<User>> {
+        let sql = format!("SELECT {USER_COLUMNS} FROM users WHERE email = ?");
+        Ok(sqlx::query_as::<_, User>(&sql)
+            .bind(email)
+            .fetch_all(self.pool.get().await?.deref_mut())
+            .await?)
+    }
+
+    pub async fn find_user_by_oauth(
+        &self,
+        provider: &str,
+        subject: &str,
+    ) -> ResultType<Option<User>> {
+        let sql = format!(
+            "SELECT {USER_COLUMNS} FROM users WHERE oauth_provider = ? AND oauth_subject = ?"
+        );
+        Ok(sqlx::query_as::<_, User>(&sql)
+            .bind(provider)
+            .bind(subject)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?)
+    }
+
+    pub async fn create_oidc_user(
+        &self,
+        username: &str,
+        email: Option<&str>,
+        provider: &str,
+        subject: &str,
+    ) -> ResultType<User> {
+        Ok(sqlx::query_as::<_, User>(
+            "
+            INSERT INTO users(username, password_hash, email, role, oauth_provider, oauth_subject, last_login_at)
+            VALUES(?, '', ?, 'user', ?, ?, current_timestamp)
+            RETURNING id, username, password_hash, email, role, is_active, token_version, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
+            ",
+        )
+        .bind(username)
+        .bind(email)
+        .bind(provider)
+        .bind(subject)
+        .fetch_one(self.pool.get().await?.deref_mut())
+        .await?)
+    }
+
+    pub async fn link_user_to_oidc(
+        &self,
+        user_id: i64,
+        provider: &str,
+        subject: &str,
+    ) -> ResultType<User> {
+        let affected = sqlx::query(
+            "
+            UPDATE users
+            SET oauth_provider = ?, oauth_subject = ?, last_login_at = current_timestamp, updated_at = current_timestamp
+            WHERE id = ? AND (oauth_provider IS NULL OR oauth_provider = '')
+            ",
+        )
+        .bind(provider)
+        .bind(subject)
+        .bind(user_id)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        if affected.rows_affected() == 0 {
+            bail!("user already linked or not found");
+        }
+        self.find_user_by_id(user_id)
+            .await?
+            .ok_or_else(|| hbb_common::anyhow::anyhow!("user not found"))
+    }
+
+    pub async fn update_last_login(&self, user_id: i64) -> ResultType<User> {
+        let affected = sqlx::query(
+            "
+            UPDATE users
+            SET last_login_at = current_timestamp
+            WHERE id = ?
+            ",
+        )
+        .bind(user_id)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        if affected.rows_affected() == 0 {
+            bail!("user not found");
+        }
+        self.find_user_by_id(user_id)
+            .await?
+            .ok_or_else(|| hbb_common::anyhow::anyhow!("user not found"))
     }
 
     pub async fn update_user(&self, id: i64, fields: UpdateUserFields) -> ResultType<User> {
@@ -474,6 +565,14 @@ mod tests {
                 column_exists(&db, "users", "token_version").await.unwrap(),
                 "users.token_version should exist"
             );
+            for column in ["oauth_provider", "oauth_subject", "last_login_at"] {
+                assert!(
+                    column_exists(&db, "users", column).await.unwrap(),
+                    "users.{column} should exist"
+                );
+            }
+            assert!(index_exists(&db, "idx_users_oauth").await.unwrap());
+            assert!(index_exists(&db, "idx_users_last_login_at").await.unwrap());
 
             cleanup(&path);
         });
@@ -493,6 +592,12 @@ mod tests {
                 column_exists(&db, "users", "token_version").await.unwrap(),
                 "users.token_version should be repaired"
             );
+            for column in ["oauth_provider", "oauth_subject", "last_login_at"] {
+                assert!(
+                    column_exists(&db, "users", column).await.unwrap(),
+                    "users.{column} should be added by migration"
+                );
+            }
             assert!(index_exists(&db, "idx_users_token_version").await.unwrap());
             cleanup(&path);
         });

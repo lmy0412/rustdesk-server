@@ -1,9 +1,13 @@
 use crate::{
-    auth::jwt::{verify_token, AuthState, CurrentUser, JwtError},
+    auth::{
+        jwt::{verify_token, AuthState, CurrentUser, JwtError},
+        ACCESS_TOKEN_COOKIE,
+    },
+    config::OidcConfig,
     database::Database,
 };
 use axum::{
-    http::{Request, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     middleware::Next,
     response::Response,
     Json,
@@ -14,7 +18,7 @@ use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use std::{num::NonZeroUsize, sync::Mutex, time::Instant};
 use tower::layer::util::Identity;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, Any, CorsLayer};
 
 static TOKEN_VERSION_DENY_CACHE: Lazy<Mutex<LruCache<(i64, i64), ()>>> =
     Lazy::new(|| Mutex::new(LruCache::new(NonZeroUsize::new(1000).unwrap())));
@@ -46,11 +50,26 @@ pub async fn request_logger<B>(request: Request<B>, next: Next<B>) -> Response {
     response
 }
 
-pub fn cors_middleware() -> CorsLayer {
-    CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any)
+pub fn cors_middleware(oidc_config: &OidcConfig) -> CorsLayer {
+    if oidc_config.allowed_origins.is_empty() {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    } else {
+        let origins = oidc_config
+            .allowed_origins
+            .iter()
+            .map(|origin| {
+                HeaderValue::from_str(origin).expect("allowed_origins 已在配置加载阶段校验")
+            })
+            .collect::<Vec<_>>();
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods(AllowMethods::mirror_request())
+            .allow_headers(AllowHeaders::mirror_request())
+            .allow_credentials(true)
+    }
 }
 
 /// Issue #3 中不启用真实限流；后续可在这里替换为实际 RateLimitLayer。
@@ -89,9 +108,17 @@ pub async fn auth_layer<B>(
                 Json(json!({ "error": "auth_state not available" })),
             )
         })?;
+    let oidc_config = request
+        .extensions()
+        .get::<OidcConfig>()
+        .cloned()
+        .unwrap_or_default();
 
-    let token = extract_bearer_token(&request)?;
-    let claims = verify_token(token, &auth_state.jwt_secret).map_err(jwt_error_response)?;
+    let (token, from_cookie) = extract_token(&request)?;
+    if from_cookie && requires_cross_origin_cookie_check(&request, &oidc_config) {
+        validate_cookie_request_origin(&request, &oidc_config)?;
+    }
+    let claims = verify_token(&token, &auth_state.jwt_secret).map_err(jwt_error_response)?;
 
     if is_token_cached_rejected(claims.sub, claims.token_ver) {
         return Err((
@@ -174,34 +201,115 @@ fn clear_rejection_cache_if_needed() {
 fn is_public_path(path: &str) -> bool {
     matches!(
         path,
-        "/api/auth/login" | "/api/auth/refresh" | "/api/health" | "/api/version"
+        "/api/auth/login"
+            | "/api/auth/refresh"
+            | "/api/auth/oidc/login"
+            | "/api/auth/oidc/callback"
+            | "/api/health"
+            | "/api/version"
     )
 }
 
-fn extract_bearer_token<B>(request: &Request<B>) -> Result<&str, (StatusCode, Json<Value>)> {
-    let value = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "missing authorization header" })),
-            )
-        })?
-        .to_str()
-        .map_err(|_| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "invalid authorization header" })),
-            )
-        })?;
+fn extract_token<B>(request: &Request<B>) -> Result<(String, bool), (StatusCode, Json<Value>)> {
+    if let Some(token) = extract_bearer_token(request)? {
+        return Ok((token.to_string(), false));
+    }
+    if let Some(token) = extract_cookie_token(request) {
+        return Ok((token, true));
+    }
+    Err((
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": "missing authorization header" })),
+    ))
+}
 
-    value.strip_prefix("Bearer ").ok_or_else(|| {
+fn extract_bearer_token<B>(
+    request: &Request<B>,
+) -> Result<Option<&str>, (StatusCode, Json<Value>)> {
+    let Some(value) = request.headers().get(header::AUTHORIZATION) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid authorization header" })),
+        )
+    })?;
+
+    value.strip_prefix("Bearer ").map(Some).ok_or_else(|| {
         (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "invalid authorization format" })),
         )
     })
+}
+
+fn extract_cookie_token<B>(request: &Request<B>) -> Option<String> {
+    let value = request.headers().get(header::COOKIE)?.to_str().ok()?;
+    value.split(';').find_map(|part| {
+        let (name, value) = part.trim().split_once('=')?;
+        if name == ACCESS_TOKEN_COOKIE {
+            Some(value.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn requires_cross_origin_cookie_check<B>(request: &Request<B>, config: &OidcConfig) -> bool {
+    !config.allowed_origins.is_empty()
+        && matches!(
+            *request.method(),
+            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+        )
+}
+
+fn validate_cookie_request_origin<B>(
+    request: &Request<B>,
+    config: &OidcConfig,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    validate_cookie_request_origin_headers(request.headers(), config)
+}
+
+pub fn validate_cookie_request_origin_headers(
+    headers: &HeaderMap,
+    config: &OidcConfig,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if headers
+        .get(header::ORIGIN)
+        .and_then(|origin| origin.to_str().ok())
+        .filter(|origin| is_allowed_origin(origin, &config.allowed_origins))
+        .is_some()
+    {
+        return Ok(());
+    }
+    if headers
+        .get(header::REFERER)
+        .and_then(|referer| referer.to_str().ok())
+        .and_then(origin_from_referer)
+        .filter(|origin| is_allowed_origin(origin, &config.allowed_origins))
+        .is_some()
+    {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": "cross-origin cookie request rejected" })),
+    ))
+}
+
+fn is_allowed_origin(origin: &str, allowed_origins: &[String]) -> bool {
+    let normalized = origin.trim().trim_end_matches('/');
+    allowed_origins
+        .iter()
+        .any(|allowed| allowed.trim().trim_end_matches('/') == normalized)
+}
+
+fn origin_from_referer(referer: &str) -> Option<String> {
+    let uri: Uri = referer.parse().ok()?;
+    let scheme = uri.scheme_str()?;
+    let authority = uri.authority()?;
+    Some(format!("{}://{}", scheme, authority))
 }
 
 fn jwt_error_response(err: JwtError) -> (StatusCode, Json<Value>) {
