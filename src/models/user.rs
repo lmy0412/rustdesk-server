@@ -12,6 +12,11 @@ pub struct User {
     pub is_active: bool,
     #[serde(skip_serializing)]
     pub token_version: i64,
+    #[serde(skip_serializing)]
+    pub oauth_provider: Option<String>,
+    #[serde(skip_serializing)]
+    pub oauth_subject: Option<String>,
+    pub last_login_at: Option<NaiveDateTime>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }

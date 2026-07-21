@@ -117,6 +117,8 @@ impl Default for SmtpConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OidcConfig {
     #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
     pub issuer_url: String,
     #[serde(default)]
     pub client_id: String,
@@ -125,16 +127,34 @@ pub struct OidcConfig {
     pub client_secret: String,
     #[serde(default)]
     pub redirect_uri: String,
+    #[serde(default)]
+    pub post_login_url: String,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 impl Default for OidcConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             issuer_url: String::new(),
             client_id: String::new(),
             client_secret: String::new(),
             redirect_uri: String::new(),
+            post_login_url: String::new(),
+            allowed_origins: Vec::new(),
         }
+    }
+}
+
+impl OidcConfig {
+    pub fn is_configured(&self) -> bool {
+        self.enabled
+            && !self.issuer_url.trim().is_empty()
+            && !self.client_id.trim().is_empty()
+            && !self.client_secret.trim().is_empty()
+            && !self.redirect_uri.trim().is_empty()
+            && !self.post_login_url.trim().is_empty()
     }
 }
 
@@ -416,11 +436,14 @@ impl fmt::Display for OidcConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "OidcConfig {{ issuer_url: {}, client_id: {}, client_secret: {}, redirect_uri: {} }}",
+            "OidcConfig {{ enabled: {}, issuer_url: {}, client_id: {}, client_secret: {}, redirect_uri: {}, post_login_url: {}, allowed_origins: {:?} }}",
+            self.enabled,
             self.issuer_url,
             self.client_id,
             mask_sensitive(&self.client_secret),
-            self.redirect_uri
+            self.redirect_uri,
+            self.post_login_url,
+            self.allowed_origins
         )
     }
 }
@@ -1024,6 +1047,32 @@ fn validate_config(cfg: &AppConfig) -> Result<(), String> {
     }
     if cfg.pro.refresh_expiry_days <= 0 {
         return Err("pro.refresh_expiry_days must be positive".to_string());
+    }
+    validate_allowed_origins(&cfg.pro.oidc.allowed_origins)?;
+    Ok(())
+}
+
+fn validate_allowed_origins(origins: &[String]) -> Result<(), String> {
+    for origin in origins {
+        let value = origin.trim();
+        http::HeaderValue::from_str(value).map_err(|err| {
+            format!(
+                "pro.oidc.allowed_origins contains invalid header value '{}': {}",
+                origin, err
+            )
+        })?;
+        let uri: http::Uri = value.parse().map_err(|err| {
+            format!(
+                "pro.oidc.allowed_origins contains invalid origin '{}': {}",
+                origin, err
+            )
+        })?;
+        if uri.scheme_str().is_none() || uri.authority().is_none() || uri.path() != "/" {
+            return Err(format!(
+                "pro.oidc.allowed_origins must be origins like https://example.com, got '{}'",
+                origin
+            ));
+        }
     }
     Ok(())
 }
