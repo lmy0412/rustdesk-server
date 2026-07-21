@@ -1,8 +1,10 @@
 mod rendezvous_server;
 pub use rendezvous_server::*;
 pub mod api;
+pub mod auth;
 pub mod common;
 pub mod config;
-mod database;
+pub mod database;
+pub mod models;
 mod peer;
 mod version;
