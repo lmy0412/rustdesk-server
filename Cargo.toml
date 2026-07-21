@@ -61,6 +61,10 @@ local-ip-address = "0.5.1"
 dns-lookup = "1.0.8"
 ping = "0.4.0"
 flate2 = "1.0"
+protobuf = "3.4"
+ed25519-dalek = { version = "2", features = ["pkcs8"] }
+data-encoding = "2"
+thiserror = "1"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 # https://github.com/rustdesk/rustdesk-server-pro/issues/189, using native-tls for better tls support
@@ -71,6 +75,7 @@ reqwest = { git = "https://github.com/rustdesk-org/reqwest", features = ["blocki
 
 [build-dependencies]
 hbb_common = { path = "libs/hbb_common" }
+protobuf-codegen = "3.4"
 
 [workspace]
 members = ["libs/hbb_common"]

@@ -1,5 +1,6 @@
 use crate::models::user::User;
 use async_trait::async_trait;
+use chrono::{DateTime, NaiveDateTime};
 use hbb_common::{bail, log, ResultType};
 use sqlx::{
     sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, Row, Sqlite,
@@ -61,6 +62,18 @@ pub struct UpdateUserFields {
     pub is_active: Option<bool>,
     pub password_hash: Option<String>,
     pub increment_token_version: bool,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct LicenseRecord {
+    pub id: i64,
+    pub license_key: String,
+    pub user_id: Option<i64>,
+    pub device_limit: i32,
+    pub issued_at: NaiveDateTime,
+    pub expires_at: Option<NaiveDateTime>,
+    pub is_active: bool,
+    pub features: Option<String>,
 }
 
 impl Database {
@@ -446,6 +459,67 @@ impl Database {
             .fetch_one(self.pool.get().await?.deref_mut())
             .await?;
         Ok(row.try_get::<i64, _>("count")?)
+    }
+
+    pub async fn upsert_license(
+        &self,
+        license_key: &str,
+        device_limit: u32,
+        expires_at: Option<i64>,
+        features: u64,
+        user_id: Option<i64>,
+    ) -> ResultType<()> {
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        sqlx::query("UPDATE licenses SET is_active = 0 WHERE is_active = 1")
+            .execute(&mut tx)
+            .await?;
+        let expires_at = expires_at
+            .and_then(|timestamp| DateTime::from_timestamp(timestamp, 0))
+            .map(|datetime| datetime.naive_utc());
+        sqlx::query(
+            "
+            INSERT INTO licenses(license_key, user_id, device_limit, expires_at, is_active, features)
+            VALUES(?, ?, ?, ?, 1, ?)
+            ON CONFLICT(license_key) DO UPDATE SET
+                user_id = excluded.user_id,
+                device_limit = excluded.device_limit,
+                expires_at = excluded.expires_at,
+                is_active = 1,
+                features = excluded.features
+            ",
+        )
+        .bind(license_key)
+        .bind(user_id)
+        .bind(device_limit as i64)
+        .bind(expires_at)
+        .bind(features.to_string())
+        .execute(&mut tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn get_active_license_key(&self) -> ResultType<Option<String>> {
+        let row = sqlx::query(
+            "
+            SELECT license_key
+            FROM licenses
+            WHERE is_active = 1
+            ORDER BY id DESC
+            LIMIT 1
+            ",
+        )
+        .fetch_optional(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(row
+            .as_ref()
+            .map(|row| row.try_get::<String, _>("license_key"))
+            .transpose()?)
+    }
+
+    pub async fn count_active_devices(&self) -> ResultType<u32> {
+        Ok(0)
     }
 
     pub async fn get_user_token_version(&self, id: i64) -> ResultType<i64> {
