@@ -66,6 +66,6 @@ fn main() -> ResultType<()> {
     let rmem = config.relay.rmem;
     let serial = config.rendezvous.serial;
     crate::common::check_software_update();
-    RendezvousServer::start(port, serial, &config.server.key, rmem)?;
+    RendezvousServer::start(port, serial, &config.server.key, rmem, config.pro.enabled)?;
     Ok(())
 }

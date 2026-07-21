@@ -1,4 +1,5 @@
 use crate::common::*;
+use crate::license::{self, LicenseError};
 use crate::peer::*;
 use hbb_common::{
     allow_err, bail,
@@ -65,7 +66,12 @@ static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
 use once_cell::sync::Lazy;
 use tokio::sync::Mutex as TokioMutex; // differentiate if needed
 #[derive(Clone)]
-struct PunchReqEntry { tm: Instant, from_ip: String, to_ip: String, to_id: String }
+struct PunchReqEntry {
+    tm: Instant,
+    from_ip: String,
+    to_ip: String,
+    to_id: String,
+}
 static PUNCH_REQS: Lazy<TokioMutex<Vec<PunchReqEntry>>> = Lazy::new(|| TokioMutex::new(Vec::new()));
 const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
 
@@ -77,6 +83,7 @@ struct Inner {
     mask: Option<Ipv4Network>,
     local_ip: String,
     sk: Option<sign::SecretKey>,
+    pro_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -99,7 +106,13 @@ enum LoopFailure {
 
 impl RendezvousServer {
     #[tokio::main(flavor = "multi_thread")]
-    pub async fn start(port: i32, serial: i32, key: &str, rmem: usize) -> ResultType<()> {
+    pub async fn start(
+        port: i32,
+        serial: i32,
+        key: &str,
+        rmem: usize,
+        pro_enabled: bool,
+    ) -> ResultType<()> {
         let (key, sk) = Self::get_server_sk(key);
         let nat_port = port - 1;
         let ws_port = port + 2;
@@ -141,6 +154,7 @@ impl RendezvousServer {
                 sk,
                 mask,
                 local_ip,
+                pro_enabled,
             }),
         };
         log::info!("mask: {:?}", rs.inner.mask);
@@ -499,6 +513,12 @@ impl RendezvousServer {
                     return true;
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
+                    if let Some(response) = self.pro_license_failure_response(addr) {
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_punch_hole_response(response);
+                        Self::send_to_sink(sink, msg_out).await;
+                        return true;
+                    }
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
@@ -687,8 +707,18 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
-        if !key.is_empty() && ph.licence_key != key {
-            log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
+        if self.inner.pro_enabled {
+            if let Some(response) = self.pro_license_failure_response(addr) {
+                let mut msg_out = RendezvousMessage::new();
+                msg_out.set_punch_hole_response(response);
+                return Ok((msg_out, None));
+            }
+        } else if !key.is_empty() && ph.licence_key != key {
+            log::warn!(
+                "Authentication failed from {} for peer {} - invalid key",
+                addr,
+                ph.id
+            );
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
@@ -715,7 +745,7 @@ impl RendezvousServer {
                 });
                 return Ok((msg_out, None));
             }
-            
+
             // record punch hole request (from addr -> peer id/peer_addr)
             {
                 let from_ip = try_into_v4(addr).ip().to_string();
@@ -723,13 +753,23 @@ impl RendezvousServer {
                 let to_id_clone = id.clone();
                 let mut lock = PUNCH_REQS.lock().await;
                 let mut dup = false;
-                for e in lock.iter().rev().take(30) { // only check recent tail subset for speed
+                for e in lock.iter().rev().take(30) {
+                    // only check recent tail subset for speed
                     if e.from_ip == from_ip && e.to_id == to_id_clone {
-                        if e.tm.elapsed().as_secs() < PUNCH_REQ_DEDUPE_SEC { dup = true; }
+                        if e.tm.elapsed().as_secs() < PUNCH_REQ_DEDUPE_SEC {
+                            dup = true;
+                        }
                         break;
                     }
                 }
-                if !dup { lock.push(PunchReqEntry { tm: Instant::now(), from_ip, to_ip, to_id: to_id_clone }); }
+                if !dup {
+                    lock.push(PunchReqEntry {
+                        tm: Instant::now(),
+                        from_ip,
+                        to_ip,
+                        to_id: to_id_clone,
+                    });
+                }
             }
 
             let mut msg_out = RendezvousMessage::new();
@@ -787,6 +827,40 @@ impl RendezvousServer {
             });
             Ok((msg_out, None))
         }
+    }
+
+    fn pro_license_failure_response(&self, addr: SocketAddr) -> Option<PunchHoleResponse> {
+        if !self.inner.pro_enabled {
+            return None;
+        }
+        let failure = match license::check_license_valid_for_connection() {
+            Ok(()) => return None,
+            Err(LicenseError::Overuse { current, max }) => {
+                log::warn!(
+                    "许可证设备配额超限 {}/{}，拒绝来自 {} 的连接",
+                    current,
+                    max,
+                    addr
+                );
+                punch_hole_response::Failure::LICENSE_OVERUSE
+            }
+            Err(LicenseError::NoLicense) => {
+                log::warn!("Pro 许可证未配置，拒绝来自 {} 的连接", addr);
+                punch_hole_response::Failure::LICENSE_MISMATCH
+            }
+            Err(LicenseError::Expired(expired_at)) => {
+                log::warn!("Pro 许可证已过期({})，拒绝来自 {} 的连接", expired_at, addr);
+                punch_hole_response::Failure::LICENSE_MISMATCH
+            }
+            Err(err) => {
+                log::warn!("许可证检查失败，拒绝来自 {} 的连接: {}", addr, err);
+                punch_hole_response::Failure::LICENSE_MISMATCH
+            }
+        };
+        Some(PunchHoleResponse {
+            failure: failure.into(),
+            ..Default::default()
+        })
     }
 
     #[inline]
@@ -1051,17 +1125,27 @@ impl RendezvousServer {
                 use std::fmt::Write as _;
                 let mut lock = PUNCH_REQS.lock().await;
                 let arg = fds.next();
-                if let Some("-") = arg { lock.clear(); }
-                else {
+                if let Some("-") = arg {
+                    lock.clear();
+                } else {
                     let mut start = arg.and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
-                    let mut page_size = fds.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(10);
-                    if page_size == 0 { page_size = 10; }
+                    let mut page_size = fds
+                        .next()
+                        .and_then(|x| x.parse::<usize>().ok())
+                        .unwrap_or(10);
+                    if page_size == 0 {
+                        page_size = 10;
+                    }
                     for (_, e) in lock.iter().enumerate().skip(start).take(page_size) {
                         let age = e.tm.elapsed();
                         let event_system = std::time::SystemTime::now() - age;
                         let event_iso = chrono::DateTime::<chrono::Utc>::from(event_system)
                             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-                        let _ = writeln!(res, "{} {} -> {}@{}", event_iso, e.from_ip, e.to_id, e.to_ip);
+                        let _ = writeln!(
+                            res,
+                            "{} {} -> {}@{}",
+                            event_iso, e.from_ip, e.to_id, e.to_ip
+                        );
                     }
                 }
             }

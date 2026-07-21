@@ -1,6 +1,7 @@
 pub mod admin_init;
 pub mod auth;
 pub mod health;
+pub mod license;
 pub mod middleware;
 pub mod oidc;
 pub mod users;
@@ -30,6 +31,9 @@ pub fn build_router(db: Database, auth_state: AuthState, oidc_config: OidcConfig
                 .put(users::handle_update_user)
                 .delete(users::handle_delete_user),
         )
+        .route("/api/license/status", get(license::handle_license_status))
+        .route("/api/license/usage", get(license::handle_license_usage))
+        .route("/api/license/upload", post(license::handle_license_upload))
         .layer(
             ServiceBuilder::new()
                 .layer(Extension(db.clone()))
@@ -90,6 +94,10 @@ pub fn api_server_forever(
             let _ = ready_tx.send(Err(message.clone()));
             eprintln!("Fatal: {}", message);
             std::process::exit(1);
+        }
+        crate::license::init_license_state();
+        if let Err(err) = crate::license::load_license_from_database(&db).await {
+            log::warn!("许可证加载失败，Pro 模式新连接将被拒绝: {}", err);
         }
 
         let app = build_router(db, auth_state, oidc_config);
