@@ -3,8 +3,9 @@ use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 use hbb_common::log;
 use protobuf::Message as _;
-use std::sync::{OnceLock, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::license_proto::license as proto;
 
@@ -45,6 +46,19 @@ pub struct LicenseState {
 }
 
 pub static LICENSE_STATE: OnceLock<RwLock<LicenseState>> = OnceLock::new();
+static QUOTA_LOG_STATE: OnceLock<Mutex<QuotaLogState>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum QuotaBand {
+    Normal,
+    Warning,
+    Full,
+}
+
+struct QuotaLogState {
+    last_band: QuotaBand,
+    overuse: HashMap<String, Instant>,
+}
 
 pub fn init_license_state() {
     let _ = LICENSE_STATE.get_or_init(|| {
@@ -159,6 +173,88 @@ pub fn now_timestamp() -> i64 {
         .unwrap_or(0)
 }
 
+pub fn log_quota_usage_event(context: &str, current: u32, max: u32) {
+    let band = quota_band(current, max);
+    let state = QUOTA_LOG_STATE.get_or_init(|| {
+        Mutex::new(QuotaLogState {
+            last_band: QuotaBand::Normal,
+            overuse: HashMap::new(),
+        })
+    });
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    let previous = state.last_band;
+    state.last_band = band;
+    if band <= previous {
+        return;
+    }
+    match band {
+        QuotaBand::Full => log::error!(
+            "{}后设备配额已到达或超过上限: {}/{} ({}%)",
+            context,
+            current,
+            max,
+            usage_percent(current, max)
+        ),
+        QuotaBand::Warning => log::warn!(
+            "{}后设备配额达到 90% 阈值: {}/{} ({}%)",
+            context,
+            current,
+            max,
+            usage_percent(current, max)
+        ),
+        QuotaBand::Normal => {}
+    }
+}
+
+pub fn log_overuse_limited(device_id: &str, current: u32, max: u32) {
+    let state = QUOTA_LOG_STATE.get_or_init(|| {
+        Mutex::new(QuotaLogState {
+            last_band: QuotaBand::Normal,
+            overuse: HashMap::new(),
+        })
+    });
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    state
+        .overuse
+        .retain(|_, seen| now.duration_since(*seen) < Duration::from_secs(60));
+    if state.overuse.contains_key(device_id) {
+        return;
+    }
+    state.overuse.insert(device_id.to_owned(), now);
+    log::error!("设备 {} 因配额已满被拒绝: {}/{}", device_id, current, max);
+}
+
+fn quota_band(current: u32, max: u32) -> QuotaBand {
+    if max == 0 {
+        return if current == 0 {
+            QuotaBand::Normal
+        } else {
+            QuotaBand::Full
+        };
+    }
+    let current = u64::from(current);
+    let max = u64::from(max);
+    if current.saturating_mul(100) >= max.saturating_mul(100) {
+        QuotaBand::Full
+    } else if current.saturating_mul(100) >= max.saturating_mul(90) {
+        QuotaBand::Warning
+    } else {
+        QuotaBand::Normal
+    }
+}
+
+fn usage_percent(current: u32, max: u32) -> u64 {
+    if max == 0 {
+        return if current == 0 { 0 } else { 100 };
+    }
+    u64::from(current).saturating_mul(100) / u64::from(max)
+}
+
 fn normalize_license_key(encoded: &str) -> Result<String, LicenseError> {
     let upper = encoded.trim().to_ascii_uppercase();
     let body = upper.strip_prefix("RUSTDESK-").ok_or_else(|| {
@@ -238,5 +334,13 @@ mod tests {
         let err = check_license_valid_for_connection().unwrap_err();
         assert!(matches!(err, LicenseError::Expired(_)));
         clear_license();
+    }
+
+    #[test]
+    fn quota_thresholds_are_integer_and_exact() {
+        assert_eq!(quota_band(8, 10), QuotaBand::Normal);
+        assert_eq!(quota_band(9, 10), QuotaBand::Warning);
+        assert_eq!(quota_band(10, 10), QuotaBand::Full);
+        assert_eq!(quota_band(11, 10), QuotaBand::Full);
     }
 }

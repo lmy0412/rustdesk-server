@@ -44,11 +44,19 @@ fn main() -> ResultType<()> {
         std::process::exit(1);
     });
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (device_control_tx, device_control_rx) = hbb_common::tokio::sync::mpsc::unbounded_channel();
     let db_url = config.server.db_path.clone();
     let auth_state = AuthState::from_config(&config.pro);
     let oidc_config = config.pro.oidc.clone();
     let _api_thread = std::thread::spawn(move || {
-        api::api_server_forever(api_addr, ready_tx, db_url, auth_state, oidc_config);
+        api::api_server_forever(
+            api_addr,
+            ready_tx,
+            db_url,
+            auth_state,
+            oidc_config,
+            device_control_tx,
+        );
     });
     match ready_rx.recv() {
         Ok(Ok(())) => {
@@ -66,6 +74,13 @@ fn main() -> ResultType<()> {
     let rmem = config.relay.rmem;
     let serial = config.rendezvous.serial;
     crate::common::check_software_update();
-    RendezvousServer::start(port, serial, &config.server.key, rmem, config.pro.enabled)?;
+    RendezvousServer::start(
+        port,
+        serial,
+        &config.server.key,
+        rmem,
+        config.pro.enabled,
+        device_control_rx,
+    )?;
     Ok(())
 }

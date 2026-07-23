@@ -1,9 +1,16 @@
-use crate::{auth::jwt::CurrentUser, database::Database};
-use axum::{extract::Extension, http::StatusCode, Json};
+use crate::{
+    auth::jwt::CurrentUser,
+    database::{Database, InactiveUpdate},
+    peer::{DeviceInvalidationCommand, DeviceInvalidationSender, InvalidationResult},
+};
+use axum::{extract::Extension, extract::Path, http::StatusCode, Json};
 use once_cell::sync::Lazy;
 use serde_derive::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::{
+    sync::{oneshot, Mutex},
+    time::{timeout, Duration},
+};
 
 type ApiError = (StatusCode, Json<Value>);
 static LICENSE_UPLOAD_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
@@ -41,10 +48,24 @@ pub struct LicenseUploadResponse {
 pub struct LicenseUsageResponse {
     pub max_devices: u32,
     pub current_devices: u32,
+    pub online_devices: u32,
+    pub offline_devices: u32,
+    pub inactive_devices: u32,
     pub max_users: u32,
     pub current_users: u32,
+    pub expires_at: Option<i64>,
+    pub days_remaining: Option<i64>,
     pub device_usage_pct: f64,
     pub user_usage_pct: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeviceInactiveResponse {
+    pub device_id: String,
+    pub status: String,
+    pub cache_invalidation: String,
+    pub database_inactive_committed: bool,
+    pub retryable: bool,
 }
 
 pub async fn handle_license_upload(
@@ -70,6 +91,13 @@ pub async fn handle_license_upload(
     .await
     .map_err(|_| internal_error("license save failed"))?;
     crate::license::set_license(license.clone());
+    if let Ok(usage) = db.device_usage().await {
+        crate::license::log_quota_usage_event(
+            "许可证上传或降额",
+            usage.current(),
+            license.max_devices,
+        );
+    }
 
     let warning = if crate::license::is_license_expired(&license) {
         Some("license has expired".to_string())
@@ -129,10 +157,11 @@ pub async fn handle_license_usage(
         .as_ref()
         .map(|license| license.max_users)
         .unwrap_or(0);
-    let current_devices = db
-        .count_active_devices()
+    let usage = db
+        .device_usage()
         .await
         .map_err(|_| internal_error("device usage lookup failed"))?;
+    let current_devices = usage.current();
     let current_users = db
         .count_users()
         .await
@@ -142,10 +171,61 @@ pub async fn handle_license_usage(
     Ok(Json(LicenseUsageResponse {
         max_devices,
         current_devices,
+        online_devices: usage.online,
+        offline_devices: usage.offline,
+        inactive_devices: usage.inactive,
         max_users,
         current_users,
+        expires_at: license.as_ref().map(|license| license.expires_at),
+        days_remaining: license.as_ref().and_then(crate::license::days_remaining),
         device_usage_pct: pct(current_devices, max_devices),
         user_usage_pct: pct(current_users, max_users),
+    }))
+}
+
+pub async fn handle_device_inactive(
+    Path(device_id): Path<String>,
+    Extension(db): Extension<Database>,
+    Extension(device_control_tx): Extension<DeviceInvalidationSender>,
+    Extension(current): Extension<CurrentUser>,
+) -> Result<Json<DeviceInactiveResponse>, ApiError> {
+    require_admin(&current)?;
+    match db
+        .set_device_inactive(&device_id)
+        .await
+        .map_err(|_| internal_error("device inactive update failed"))?
+    {
+        InactiveUpdate::NotFound => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "device not found" })),
+            ));
+        }
+        InactiveUpdate::Updated | InactiveUpdate::AlreadyInactive => {}
+    }
+
+    // 即使数据库原本已 inactive，也必须重发失效命令，以便幂等重试修复缓存。
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if device_control_tx
+        .send(DeviceInvalidationCommand {
+            device_id: device_id.clone(),
+            ack: ack_tx,
+        })
+        .is_err()
+    {
+        return Err(invalidation_unavailable());
+    }
+
+    let invalidation = match timeout(Duration::from_secs(2), ack_rx).await {
+        Ok(Ok(Ok(result))) => result,
+        Ok(Ok(Err(()))) | Ok(Err(_)) | Err(_) => return Err(invalidation_unavailable()),
+    };
+    Ok(Json(DeviceInactiveResponse {
+        device_id,
+        status: "inactive_committed".to_string(),
+        cache_invalidation: invalidation_name(invalidation).to_string(),
+        database_inactive_committed: true,
+        retryable: false,
     }))
 }
 
@@ -185,4 +265,24 @@ fn internal_error(message: &str) -> ApiError {
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "error": message })),
     )
+}
+
+fn invalidation_unavailable() -> ApiError {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "device is inactive in database, but rendezvous cache invalidation was not confirmed",
+            "database_inactive_committed": true,
+            "retryable": true
+        })),
+    )
+}
+
+fn invalidation_name(result: InvalidationResult) -> &'static str {
+    match result {
+        InvalidationResult::Removed => "removed",
+        InvalidationResult::AlreadyAbsent => "already_absent",
+        InvalidationResult::Replaced => "replaced",
+        InvalidationResult::NoLongerInactive => "no_longer_inactive",
+    }
 }

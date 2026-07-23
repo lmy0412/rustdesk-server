@@ -1,4 +1,5 @@
 use crate::common::*;
+use crate::database::{DeviceAdmissionFailure, DeviceAdmissionResult};
 use crate::license::{self, LicenseError};
 use crate::peer::*;
 use hbb_common::{
@@ -13,10 +14,7 @@ use hbb_common::{
     },
     log,
     protobuf::{Message as _, MessageField},
-    rendezvous_proto::{
-        register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
-        *,
-    },
+    rendezvous_proto::*,
     tcp::{listen_any, FramedStream},
     timeout,
     tokio::{
@@ -24,7 +22,7 @@ use hbb_common::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
         sync::{mpsc, Mutex},
-        time::{interval, Duration},
+        time::{interval, Duration, MissedTickBehavior},
     },
     tokio_util::codec::Framed,
     try_into_v4,
@@ -49,6 +47,16 @@ enum Data {
 }
 
 const REG_TIMEOUT: i32 = 30_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrationResult {
+    Ok,
+    UuidMismatch,
+    TooFrequent,
+    LicenseMismatch,
+    LicenseOveruse { current: u32, max: u32 },
+    ServerError,
+}
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
@@ -95,6 +103,7 @@ pub struct RendezvousServer {
     relay_servers0: Arc<RelayServers>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
+    pending_registrations: Arc<Mutex<PendingRegistrationLimiter>>,
 }
 
 enum LoopFailure {
@@ -112,11 +121,19 @@ impl RendezvousServer {
         key: &str,
         rmem: usize,
         pro_enabled: bool,
+        mut device_rx: DeviceInvalidationReceiver,
     ) -> ResultType<()> {
         let (key, sk) = Self::get_server_sk(key);
         let nat_port = port - 1;
         let ws_port = port + 2;
         let pm = PeerMap::new().await?;
+        let startup_offline = pm.db.mark_startup_online_offline().await?;
+        if startup_offline > 0 {
+            log::info!(
+                "启动时已将 {} 个残留 online 设备校正为 offline",
+                startup_offline
+            );
+        }
         log::info!("serial={}", serial);
         let rendezvous_servers = get_servers(&get_arg("rendezvous-servers"), "rendezvous-servers");
         log::info!("Listening on tcp/udp :{}", port);
@@ -156,6 +173,7 @@ impl RendezvousServer {
                 local_ip,
                 pro_enabled,
             }),
+            pending_registrations: Arc::new(Mutex::new(PendingRegistrationLimiter::default())),
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
@@ -213,6 +231,7 @@ impl RendezvousServer {
                         &mut listener3,
                         &mut socket,
                         &key,
+                        &mut device_rx,
                     )
                     .await
                 {
@@ -242,6 +261,8 @@ impl RendezvousServer {
         )
     }
 
+    // 主事件循环显式持有各监听器与两个命令接收端，避免把运行时资源藏入全局状态。
+    #[allow(clippy::too_many_arguments)]
     async fn io_loop(
         &mut self,
         rx: &mut Receiver,
@@ -250,10 +271,43 @@ impl RendezvousServer {
         listener3: &mut TcpListener,
         socket: &mut FramedSocket,
         key: &str,
+        device_rx: &mut DeviceInvalidationReceiver,
     ) -> LoopFailure {
         let mut timer_check_relay = interval(Duration::from_millis(CHECK_RELAY_TIMEOUT));
+        timer_check_relay.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut timer_offline = interval(Duration::from_secs(5));
+        timer_offline.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut timer_inactive = interval(Duration::from_secs(60 * 60));
+        timer_inactive.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                Some(command) = device_rx.recv() => {
+                    let result = match self.pm.invalidate_if_still_inactive(&command.device_id).await {
+                        Ok(result) => Ok(result),
+                        Err(err) => {
+                            log::error!("处理设备 {} 缓存失效命令失败: {:#}", command.device_id, err);
+                            Err(())
+                        }
+                    };
+                    let _ = command.ack.send(result);
+                }
+                _ = timer_offline.tick() => {
+                    if let Err(err) = self.pm.db.mark_stale_online_offline().await {
+                        log::error!("online 转 offline 后台任务失败: {:#}", err);
+                    }
+                }
+                _ = timer_inactive.tick() => {
+                    match self.pm.db.mark_stale_offline_inactive().await {
+                        Ok(ids) => {
+                            for id in ids {
+                                if let Err(err) = self.pm.invalidate_if_still_inactive(&id).await {
+                                    log::error!("后台清理设备 {} 缓存失败: {:#}", id, err);
+                                }
+                            }
+                        }
+                        Err(err) => log::error!("offline 转 inactive 后台任务失败: {:#}", err),
+                    }
+                }
                 _ = timer_check_relay.tick() => {
                     if self.relay_servers0.len() > 1 {
                         let rs = self.relay_servers0.clone();
@@ -354,89 +408,8 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    if rk.uuid.is_empty() || rk.pk.is_empty() {
-                        return Ok(());
-                    }
-                    let id = rk.id;
-                    let ip = addr.ip().to_string();
-                    if id.len() < 6 {
-                        return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                    } else if !self.check_ip_blocker(&ip, &id).await {
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
-                    }
-                    let peer = self.pm.get_or(&id).await;
-                    let (changed, ip_changed) = {
-                        let peer = peer.read().await;
-                        if peer.uuid.is_empty() {
-                            (true, false)
-                        } else {
-                            if peer.uuid == rk.uuid {
-                                if peer.info.ip != ip && peer.pk != rk.pk {
-                                    log::warn!(
-                                        "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
-                                        id,
-                                        ip,
-                                        rk.pk,
-                                        peer.info.ip,
-                                        peer.pk,
-                                    );
-                                    drop(peer);
-                                    return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                                }
-                            } else {
-                                log::warn!(
-                                    "Peer {} uuid mismatch: {:?} vs {:?}",
-                                    id,
-                                    rk.uuid,
-                                    peer.uuid
-                                );
-                                drop(peer);
-                                return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                            }
-                            let ip_changed = peer.info.ip != ip;
-                            (
-                                peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
-                                ip_changed,
-                            )
-                        }
-                    };
-                    let mut req_pk = peer.read().await.reg_pk;
-                    if req_pk.1.elapsed().as_secs() > 6 {
-                        req_pk.0 = 0;
-                    } else if req_pk.0 > 2 {
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
-                    }
-                    req_pk.0 += 1;
-                    req_pk.1 = Instant::now();
-                    peer.write().await.reg_pk = req_pk;
-                    if ip_changed {
-                        let mut lock = IP_CHANGES.lock().await;
-                        if let Some((tm, ips)) = lock.get_mut(&id) {
-                            if tm.elapsed().as_secs() > IP_CHANGE_DUR {
-                                *tm = Instant::now();
-                                ips.clear();
-                                ips.insert(ip.clone(), 1);
-                            } else if let Some(v) = ips.get_mut(&ip) {
-                                *v += 1;
-                            } else {
-                                ips.insert(ip.clone(), 1);
-                            }
-                        } else {
-                            lock.insert(
-                                id.clone(),
-                                (Instant::now(), HashMap::from([(ip.clone(), 1)])),
-                            );
-                        }
-                    }
-                    if changed {
-                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
-                    }
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_register_pk_response(RegisterPkResponse {
-                        result: register_pk_response::Result::OK.into(),
-                        ..Default::default()
-                    });
-                    socket.send(&msg_out, addr).await?
+                    let result = self.register_pk(rk, addr).await;
+                    send_registration_result(socket, addr, result).await?;
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     if self.pm.is_in_memory(&ph.id).await {
@@ -523,12 +496,16 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
-                    if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
-                        let mut msg_out = RendezvousMessage::new();
-                        rf.socket_addr = AddrMangle::encode(addr).into();
-                        msg_out.set_request_relay(rf);
-                        let peer_addr = peer.read().await.socket_addr;
-                        self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                    if let Some(peer) = self.pm.get_for_rendezvous(&rf.id).await {
+                        let peer = peer.read().await;
+                        if (peer.last_reg_time.elapsed().as_millis() as i32) < REG_TIMEOUT {
+                            let mut msg_out = RendezvousMessage::new();
+                            rf.socket_addr = AddrMangle::encode(addr).into();
+                            msg_out.set_request_relay(rf);
+                            self.tx
+                                .send(Data::Msg(msg_out.into(), peer.socket_addr))
+                                .ok();
+                        }
                     }
                     return true;
                 }
@@ -588,6 +565,114 @@ impl RendezvousServer {
         false
     }
 
+    async fn register_pk(&mut self, rk: RegisterPk, addr: SocketAddr) -> RegistrationResult {
+        if rk.uuid.is_empty() || rk.pk.is_empty() || rk.id.len() < 6 {
+            return RegistrationResult::UuidMismatch;
+        }
+        let id = rk.id;
+        let ip = addr.ip().to_string();
+        if !self.check_ip_blocker(&ip, &id).await {
+            return RegistrationResult::TooFrequent;
+        }
+
+        let cached = self.pm.get_in_memory(&id).await;
+        let reg_pk = if let Some(peer) = cached.as_ref() {
+            let mut peer = peer.write().await;
+            if peer.uuid != rk.uuid || (peer.info.ip != ip && peer.pk != rk.pk) || !peer.admitted {
+                return RegistrationResult::UuidMismatch;
+            }
+            if peer.reg_pk.1.elapsed() >= PENDING_REGISTRATION_WINDOW {
+                peer.reg_pk = (0, Instant::now());
+            }
+            if peer.reg_pk.0 >= 3 {
+                return RegistrationResult::TooFrequent;
+            }
+            peer.reg_pk.0 += 1;
+            peer.reg_pk.1 = Instant::now();
+            peer.reg_pk
+        } else {
+            match self.pending_registrations.lock().await.record(&id, &ip) {
+                Some(state) => state,
+                None => return RegistrationResult::TooFrequent,
+            }
+        };
+
+        let info = serde_json::to_string(&PeerInfo { ip: ip.clone() }).unwrap_or_default();
+        let admission = match self
+            .pm
+            .db
+            .admit_device(&id, &rk.uuid, &rk.pk, &info, &ip, self.inner.pro_enabled)
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                log::error!("设备 {} 数据库准入失败: {:#}", id, err);
+                return RegistrationResult::ServerError;
+            }
+        };
+
+        match admission {
+            DeviceAdmissionResult::Rejected(DeviceAdmissionFailure::UuidMismatch) => {
+                RegistrationResult::UuidMismatch
+            }
+            DeviceAdmissionResult::Rejected(DeviceAdmissionFailure::LicenseMismatch) => {
+                RegistrationResult::LicenseMismatch
+            }
+            DeviceAdmissionResult::Rejected(DeviceAdmissionFailure::LicenseOveruse {
+                current,
+                max,
+            }) => {
+                license::log_overuse_limited(&id, current, max);
+                RegistrationResult::LicenseOveruse { current, max }
+            }
+            DeviceAdmissionResult::Admitted(admission) => {
+                let transferred_reg_pk = if cached.is_some() {
+                    reg_pk
+                } else {
+                    self.pending_registrations
+                        .lock()
+                        .await
+                        .take(&id, &ip)
+                        .unwrap_or(reg_pk)
+                };
+                if admission.previous_ip.as_deref() != Some(ip.as_str())
+                    && admission.previous_ip.is_some()
+                {
+                    self.record_ip_change(&id, &ip).await;
+                }
+                self.pm
+                    .insert_admitted(id.clone(), admission.peer, addr, transferred_reg_pk)
+                    .await;
+                if admission.newly_counted {
+                    if let Some((current, max)) = admission.usage_after {
+                        license::log_quota_usage_event("设备准入", current, max);
+                    }
+                }
+                RegistrationResult::Ok
+            }
+        }
+    }
+
+    async fn record_ip_change(&self, id: &str, ip: &str) {
+        let mut lock = IP_CHANGES.lock().await;
+        if let Some((tm, ips)) = lock.get_mut(id) {
+            if tm.elapsed().as_secs() > IP_CHANGE_DUR {
+                *tm = Instant::now();
+                ips.clear();
+                ips.insert(ip.to_owned(), 1);
+            } else if let Some(value) = ips.get_mut(ip) {
+                *value += 1;
+            } else {
+                ips.insert(ip.to_owned(), 1);
+            }
+        } else {
+            lock.insert(
+                id.to_owned(),
+                (Instant::now(), HashMap::from([(ip.to_owned(), 1)])),
+            );
+        }
+    }
+
     #[inline]
     async fn update_addr(
         &mut self,
@@ -595,32 +680,7 @@ impl RendezvousServer {
         socket_addr: SocketAddr,
         socket: &mut FramedSocket,
     ) -> ResultType<()> {
-        let (request_pk, ip_change) = if let Some(old) = self.pm.get_in_memory(&id).await {
-            let mut old = old.write().await;
-            let ip = socket_addr.ip();
-            let ip_change = if old.socket_addr.port() != 0 {
-                ip != old.socket_addr.ip()
-            } else {
-                ip.to_string() != old.info.ip
-            } && !ip.is_loopback();
-            let request_pk = old.pk.is_empty() || ip_change;
-            if !request_pk {
-                old.socket_addr = socket_addr;
-                old.last_reg_time = Instant::now();
-            }
-            let ip_change = if ip_change && old.reg_pk.0 <= 2 {
-                Some(if old.socket_addr.port() == 0 {
-                    old.info.ip.clone()
-                } else {
-                    old.socket_addr.to_string()
-                })
-            } else {
-                None
-            };
-            (request_pk, ip_change)
-        } else {
-            (true, None)
-        };
+        let (request_pk, ip_change) = self.refresh_addr_state(&id, socket_addr).await;
         if let Some(old) = ip_change {
             log::info!("IP change of {} from {} to {}", id, old, socket_addr);
         }
@@ -630,6 +690,60 @@ impl RendezvousServer {
             ..Default::default()
         });
         socket.send(&msg_out, socket_addr).await
+    }
+
+    async fn refresh_addr_state(
+        &self,
+        id: &str,
+        socket_addr: SocketAddr,
+    ) -> (bool, Option<String>) {
+        let (request_pk, ip_change) = if let Some(old) = self.pm.get_in_memory(id).await {
+            let (ip_change, previous, expired) = {
+                let old = old.read().await;
+                let ip = socket_addr.ip();
+                let ip_change = (if old.socket_addr.port() != 0 {
+                    ip != old.socket_addr.ip()
+                } else {
+                    ip.to_string() != old.info.ip
+                }) && !ip.is_loopback();
+                let previous = if old.socket_addr.port() == 0 {
+                    old.info.ip.clone()
+                } else {
+                    old.socket_addr.to_string()
+                };
+                (
+                    ip_change,
+                    previous,
+                    old.last_reg_time.elapsed().as_millis() as i32 >= REG_TIMEOUT,
+                )
+            };
+            if ip_change {
+                (true, Some(previous))
+            } else {
+                match self.pm.db.touch_admitted_device(id).await {
+                    Ok(true) => {
+                        let mut old = old.write().await;
+                        old.socket_addr = socket_addr;
+                        old.last_reg_time = Instant::now();
+                        (false, None)
+                    }
+                    Ok(false) => {
+                        if let Err(err) = self.pm.invalidate_if_still_inactive(id).await {
+                            log::error!("心跳发现设备 {} 未准入，缓存失效失败: {:#}", id, err);
+                        }
+                        (true, None)
+                    }
+                    Err(err) => {
+                        log::error!("设备 {} 心跳持久化失败: {:#}", id, err);
+                        // 数据库失败绝不刷新内存；仅保留此前 30 秒窗口的剩余时间。
+                        (expired, None)
+                    }
+                }
+            }
+        } else {
+            (true, None)
+        };
+        (request_pk, ip_change)
     }
 
     #[inline]
@@ -732,7 +846,7 @@ impl RendezvousServer {
         // fetch local addrs if in same intranet.
         // because punch hole won't work if in the same intranet,
         // all routers will drop such self-connections.
-        if let Some(peer) = self.pm.get(&id).await {
+        if let Some(peer) = self.pm.get_for_rendezvous(&id).await {
             let (elapsed, peer_addr) = {
                 let r = peer.read().await;
                 (r.last_reg_time.elapsed().as_millis() as i32, r.socket_addr)
@@ -871,7 +985,7 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
         for (i, peer_id) in peers.iter().enumerate() {
-            if let Some(peer) = self.pm.get_in_memory(peer_id).await {
+            if let Some(peer) = self.pm.get_for_rendezvous(peer_id).await {
                 let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i32;
                 // bytes index from left to right
                 let states_idx = i / 8;
@@ -1289,7 +1403,7 @@ impl RendezvousServer {
         if version.is_empty() || self.inner.sk.is_none() {
             Bytes::new()
         } else {
-            match self.pm.get(&id).await {
+            match self.pm.get_for_rendezvous(&id).await {
                 Some(peer) => {
                     let pk = peer.read().await.pk.clone();
                     sign::sign(
@@ -1422,17 +1536,31 @@ async fn test_hbbs(addr: SocketAddr) -> ResultType<()> {
 }
 
 #[inline]
-async fn send_rk_res(
+async fn send_registration_result(
     socket: &mut FramedSocket,
     addr: SocketAddr,
-    res: register_pk_response::Result,
+    result: RegistrationResult,
 ) -> ResultType<()> {
+    let res = protocol_registration_result(result);
     let mut msg_out = RendezvousMessage::new();
     msg_out.set_register_pk_response(RegisterPkResponse {
         result: res.into(),
         ..Default::default()
     });
     socket.send(&msg_out, addr).await
+}
+
+/// 上游 RegisterPkResponse 尚未给许可证错误分配正式编号。
+/// 在共享协议落地前统一映射为 SERVER_ERROR，避免占用 NOT_DEPLOYED=8 或擅用 9/10。
+fn protocol_registration_result(result: RegistrationResult) -> register_pk_response::Result {
+    match result {
+        RegistrationResult::Ok => register_pk_response::Result::OK,
+        RegistrationResult::UuidMismatch => register_pk_response::Result::UUID_MISMATCH,
+        RegistrationResult::TooFrequent => register_pk_response::Result::TOO_FREQUENT,
+        RegistrationResult::LicenseMismatch
+        | RegistrationResult::LicenseOveruse { .. }
+        | RegistrationResult::ServerError => register_pk_response::Result::SERVER_ERROR,
+    }
 }
 
 async fn create_udp_listener(port: i32, rmem: usize) -> ResultType<FramedSocket> {
@@ -1452,4 +1580,214 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
     let s = listen_any(port as _).await?;
     log::debug!("listen on tcp {:?}", s.local_addr());
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::Database;
+    use sqlx::{Connection, Executor, SqliteConnection};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn protocol_mapping_does_not_occupy_unapproved_numbers() {
+        assert_eq!(
+            protocol_registration_result(RegistrationResult::LicenseMismatch),
+            register_pk_response::Result::SERVER_ERROR
+        );
+        assert_eq!(
+            protocol_registration_result(RegistrationResult::LicenseOveruse { current: 1, max: 1 }),
+            register_pk_response::Result::SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn pro_disabled_register_peer_pk_punch_relay_and_key_exchange_keep_oss_behavior() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            license::clear_license();
+            let path = temp_db_path("oss-regression");
+            let db = Database::new(&path).await.unwrap();
+            let mut server = test_server(db, false);
+            let peer_addr: SocketAddr = "127.0.0.1:30100".parse().unwrap();
+            let result = server
+                .register_pk(
+                    RegisterPk {
+                        id: "device-oss".to_string(),
+                        uuid: Bytes::from_static(b"uuid-oss"),
+                        pk: Bytes::from_static(b"pk-oss"),
+                        ..Default::default()
+                    },
+                    peer_addr,
+                )
+                .await;
+            assert_eq!(result, RegistrationResult::Ok);
+            assert!(server.pm.is_in_memory("device-oss").await);
+            assert!(server.pro_license_failure_response(peer_addr).is_none());
+            let (request_pk, _) = server.refresh_addr_state("device-oss", peer_addr).await;
+            assert!(!request_pk);
+
+            let (_, target) = server
+                .handle_punch_hole_request(
+                    "127.0.0.1:30200".parse().unwrap(),
+                    PunchHoleRequest {
+                        id: "device-oss".to_string(),
+                        ..Default::default()
+                    },
+                    "",
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(target, Some(peer_addr));
+
+            let (relay_tx, mut relay_rx) = mpsc::unbounded_channel();
+            server.tx = relay_tx;
+            let mut relay_message = RendezvousMessage::new();
+            relay_message.set_request_relay(RequestRelay {
+                id: "device-oss".to_string(),
+                ..Default::default()
+            });
+            let mut sink = None;
+            assert!(
+                server
+                    .handle_tcp(
+                        &relay_message.write_to_bytes().unwrap(),
+                        &mut sink,
+                        "127.0.0.1:30201".parse().unwrap(),
+                        "",
+                        false,
+                    )
+                    .await
+            );
+            assert!(
+                matches!(relay_rx.recv().await, Some(Data::Msg(_, target)) if target == peer_addr)
+            );
+
+            let mut key_exchange = RendezvousMessage::new();
+            key_exchange.set_key_exchange(KeyExchange {
+                keys: vec![Bytes::from_static(b"unchanged-key")],
+                ..Default::default()
+            });
+            let mut sink = None;
+            assert!(
+                !server
+                    .handle_tcp(
+                        &key_exchange.write_to_bytes().unwrap(),
+                        &mut sink,
+                        "127.0.0.1:30202".parse().unwrap(),
+                        "",
+                        false,
+                    )
+                    .await
+            );
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn database_failure_does_not_leave_peer_map_placeholder() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("db-failure-no-placeholder");
+            let db = Database::new(&path).await.unwrap();
+            let mut server = test_server(db, false);
+            let mut conn = SqliteConnection::connect(&path).await.unwrap();
+            conn.execute("DROP TABLE devices").await.unwrap();
+
+            let result = server
+                .register_pk(
+                    RegisterPk {
+                        id: "device-fail".to_string(),
+                        uuid: Bytes::from_static(b"uuid-fail"),
+                        pk: Bytes::from_static(b"pk-fail"),
+                        ..Default::default()
+                    },
+                    "127.0.0.1:30300".parse().unwrap(),
+                )
+                .await;
+            assert_eq!(result, RegistrationResult::ServerError);
+            assert!(!server.pm.is_in_memory("device-fail").await);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn heartbeat_database_failure_never_refreshes_memory_window() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("heartbeat-db-failure");
+            let db = Database::new(&path).await.unwrap();
+            let mut server = test_server(db, false);
+            let addr: SocketAddr = "127.0.0.1:30400".parse().unwrap();
+            assert_eq!(
+                server
+                    .register_pk(
+                        RegisterPk {
+                            id: "device-heartbeat".to_string(),
+                            uuid: Bytes::from_static(b"uuid-heartbeat"),
+                            pk: Bytes::from_static(b"pk-heartbeat"),
+                            ..Default::default()
+                        },
+                        addr,
+                    )
+                    .await,
+                RegistrationResult::Ok
+            );
+            let peer = server.pm.get_in_memory("device-heartbeat").await.unwrap();
+            let before = peer.read().await.last_reg_time;
+            let mut conn = SqliteConnection::connect(&path).await.unwrap();
+            conn.execute("DROP TABLE devices").await.unwrap();
+
+            let (request_pk, _) = server.refresh_addr_state("device-heartbeat", addr).await;
+            assert!(!request_pk);
+            assert_eq!(peer.read().await.last_reg_time, before);
+
+            let expired = Instant::now() - Duration::from_secs(31);
+            peer.write().await.last_reg_time = expired;
+            let (request_pk, _) = server.refresh_addr_state("device-heartbeat", addr).await;
+            assert!(request_pk);
+            assert_eq!(peer.read().await.last_reg_time, expired);
+            cleanup(&path);
+        });
+    }
+
+    fn test_server(db: Database, pro_enabled: bool) -> RendezvousServer {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        RendezvousServer {
+            tcp_punch: Default::default(),
+            pm: PeerMap::from_database(db),
+            tx,
+            relay_servers: Default::default(),
+            relay_servers0: Default::default(),
+            rendezvous_servers: Default::default(),
+            inner: Arc::new(Inner {
+                serial: 0,
+                version: String::new(),
+                software_url: String::new(),
+                mask: None,
+                local_ip: String::new(),
+                sk: None,
+                pro_enabled,
+            }),
+            pending_registrations: Default::default(),
+        }
+    }
+
+    fn temp_db_path(name: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("rustdesk-rendezvous-{name}-{nanos}.sqlite3"))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    fn cleanup(path: &str) {
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(format!("{path}-shm")).ok();
+        std::fs::remove_file(format!("{path}-wal")).ok();
+    }
 }
