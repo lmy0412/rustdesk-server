@@ -1,17 +1,18 @@
 use crate::models::user::User;
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDateTime};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use hbb_common::{bail, log, ResultType};
 use sqlx::{
     sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, Row, Sqlite,
-    SqliteConnection,
+    SqliteConnection, Transaction,
 };
-use std::{ops::DerefMut, str::FromStr};
+use std::{ops::DerefMut, str::FromStr, time::Duration};
 //use sqlx::postgres::PgPoolOptions;
 //use sqlx::mysql::MySqlPoolOptions;
 
 type Pool = deadpool::managed::Pool<DbPool>;
 const USER_COLUMNS: &str = "id, username, password_hash, email, role, is_active, token_version, oauth_provider, oauth_subject, last_login_at, created_at, updated_at";
+const DEVICE_COLUMNS: &str = "guid, device_id AS id, uuid, pk, CAST(NULL AS BLOB) AS user, info, status, last_seen, note, owner_user_id, group_id, features, token_version";
 
 pub struct DbPool {
     url: String,
@@ -23,6 +24,7 @@ impl deadpool::managed::Manager for DbPool {
     type Error = SqlxError;
     async fn create(&self) -> Result<SqliteConnection, SqlxError> {
         let mut opt = SqliteConnectOptions::from_str(&self.url).unwrap();
+        opt = opt.busy_timeout(Duration::from_secs(2));
         opt.log_statements(log::LevelFilter::Debug);
         SqliteConnection::connect_with(&opt).await
     }
@@ -39,7 +41,7 @@ pub struct Database {
     pool: Pool,
 }
 
-#[derive(Default, sqlx::FromRow)]
+#[derive(Debug, Clone, Default, sqlx::FromRow)]
 pub struct Peer {
     pub guid: Vec<u8>,
     pub id: String,
@@ -47,12 +49,71 @@ pub struct Peer {
     pub pk: Vec<u8>,
     pub user: Option<Vec<u8>>,
     pub info: String,
-    pub status: Option<i64>,
+    pub status: String,
+    pub last_seen: NaiveDateTime,
     pub note: Option<String>,
     pub owner_user_id: Option<i64>,
     pub group_id: Option<i64>,
     pub features: Option<String>,
     pub token_version: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceStatus {
+    Online,
+    Offline,
+    Inactive,
+}
+
+impl DeviceStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Offline => "offline",
+            Self::Inactive => "inactive",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceAdmissionFailure {
+    UuidMismatch,
+    LicenseMismatch,
+    LicenseOveruse { current: u32, max: u32 },
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceAdmission {
+    pub peer: Peer,
+    pub newly_counted: bool,
+    pub usage_after: Option<(u32, u32)>,
+    pub previous_ip: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DeviceAdmissionResult {
+    Admitted(Box<DeviceAdmission>),
+    Rejected(DeviceAdmissionFailure),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceUsage {
+    pub online: u32,
+    pub offline: u32,
+    pub inactive: u32,
+}
+
+impl DeviceUsage {
+    pub fn current(&self) -> u32 {
+        self.online.saturating_add(self.offline)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InactiveUpdate {
+    Updated,
+    AlreadyInactive,
+    NotFound,
 }
 
 #[derive(Debug, Default)]
@@ -113,28 +174,21 @@ impl Database {
     }
 
     pub async fn get_peer(&self, id: &str) -> ResultType<Option<Peer>> {
-        Ok(sqlx::query_as::<_, Peer>(
-            "
-            SELECT
-                guid,
-                device_id AS id,
-                uuid,
-                pk,
-                CAST(NULL AS BLOB) AS user,
-                info,
-                CAST(NULL AS INTEGER) AS status,
-                note,
-                owner_user_id,
-                group_id,
-                features,
-                token_version
-            FROM devices
-            WHERE device_id = ?
-            ",
-        )
-        .bind(id)
-        .fetch_optional(self.pool.get().await?.deref_mut())
-        .await?)
+        let sql = format!("SELECT {DEVICE_COLUMNS} FROM devices WHERE device_id = ?");
+        Ok(sqlx::query_as::<_, Peer>(&sql)
+            .bind(id)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?)
+    }
+
+    pub async fn get_peer_for_rendezvous(&self, id: &str) -> ResultType<Option<Peer>> {
+        let sql = format!(
+            "SELECT {DEVICE_COLUMNS} FROM devices WHERE device_id = ? AND status IN ('online', 'offline')"
+        );
+        Ok(sqlx::query_as::<_, Peer>(&sql)
+            .bind(id)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?)
     }
 
     pub async fn insert_peer(
@@ -171,6 +225,277 @@ impl Database {
             .execute(self.pool.get().await?.deref_mut())
             .await?;
         Ok(())
+    }
+
+    /// 原子完成设备身份校验、许可证读取、配额统计和准入写入。
+    /// 事务取得配额锁后，所有查询都复用同一个 SQLx Transaction。
+    pub async fn admit_device(
+        &self,
+        id: &str,
+        uuid: &[u8],
+        pk: &[u8],
+        info: &str,
+        source_ip: &str,
+        pro_enabled: bool,
+    ) -> ResultType<DeviceAdmissionResult> {
+        self.admit_device_with_parser(
+            id,
+            uuid,
+            pk,
+            info,
+            source_ip,
+            pro_enabled,
+            crate::license::parse_license_key,
+        )
+        .await
+    }
+
+    // 参数保持与线上准入入口一一对应，额外 parser 仅用于在测试中注入可验证许可证。
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_device_with_parser<F>(
+        &self,
+        id: &str,
+        uuid: &[u8],
+        pk: &[u8],
+        info: &str,
+        source_ip: &str,
+        pro_enabled: bool,
+        parse_license: F,
+    ) -> ResultType<DeviceAdmissionResult>
+    where
+        F: Fn(&str) -> Result<crate::license::License, crate::license::LicenseError>,
+    {
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        lock_device_quota(&mut tx).await?;
+
+        let existing = fetch_peer_in_tx(&mut tx, id).await?;
+        if let Some(peer) = existing.as_ref() {
+            if peer.uuid != uuid {
+                return Ok(DeviceAdmissionResult::Rejected(
+                    DeviceAdmissionFailure::UuidMismatch,
+                ));
+            }
+            let previous_ip = serde_json::from_str::<serde_json::Value>(&peer.info)
+                .ok()
+                .and_then(|value| value.get("ip")?.as_str().map(ToOwned::to_owned))
+                .unwrap_or_default();
+            if previous_ip != source_ip && peer.pk != pk {
+                return Ok(DeviceAdmissionResult::Rejected(
+                    DeviceAdmissionFailure::UuidMismatch,
+                ));
+            }
+        }
+
+        let previous_ip = existing.as_ref().and_then(|peer| {
+            serde_json::from_str::<serde_json::Value>(&peer.info)
+                .ok()
+                .and_then(|value| value.get("ip")?.as_str().map(ToOwned::to_owned))
+        });
+        let newly_counted = existing
+            .as_ref()
+            .map(|peer| peer.status == DeviceStatus::Inactive.as_str())
+            .unwrap_or(true);
+        let mut usage_after = None;
+
+        if pro_enabled && newly_counted {
+            let Some(license_key) = active_license_key_in_tx(&mut tx).await? else {
+                return Ok(DeviceAdmissionResult::Rejected(
+                    DeviceAdmissionFailure::LicenseMismatch,
+                ));
+            };
+            let license = match parse_license(&license_key) {
+                Ok(license) if !crate::license::is_license_expired(&license) => license,
+                _ => {
+                    return Ok(DeviceAdmissionResult::Rejected(
+                        DeviceAdmissionFailure::LicenseMismatch,
+                    ));
+                }
+            };
+            let current = count_current_devices_in_tx(&mut tx).await?;
+            if current >= license.max_devices {
+                return Ok(DeviceAdmissionResult::Rejected(
+                    DeviceAdmissionFailure::LicenseOveruse {
+                        current,
+                        max: license.max_devices,
+                    },
+                ));
+            }
+            usage_after = Some((current.saturating_add(1), license.max_devices));
+        }
+
+        if let Some(peer) = existing.as_ref() {
+            sqlx::query(
+                "UPDATE devices
+                 SET pk = ?, info = ?, status = 'online', last_seen = current_timestamp,
+                     is_online = 1, last_online_at = current_timestamp,
+                     updated_at = current_timestamp
+                 WHERE guid = ?",
+            )
+            .bind(pk)
+            .bind(info)
+            .bind(&peer.guid)
+            .execute(&mut tx)
+            .await?;
+        } else {
+            let guid = uuid::Uuid::new_v4().as_bytes().to_vec();
+            sqlx::query(
+                "INSERT INTO devices(
+                    guid, device_id, uuid, pk, info, status, last_seen,
+                    is_online, last_online_at, updated_at
+                 ) VALUES(?, ?, ?, ?, ?, 'online', current_timestamp, 1, current_timestamp, current_timestamp)",
+            )
+            .bind(guid)
+            .bind(id)
+            .bind(uuid)
+            .bind(pk)
+            .bind(info)
+            .execute(&mut tx)
+            .await?;
+        }
+
+        let peer = fetch_peer_in_tx(&mut tx, id)
+            .await?
+            .ok_or_else(|| hbb_common::anyhow::anyhow!("device admission row disappeared"))?;
+        tx.commit().await?;
+        Ok(DeviceAdmissionResult::Admitted(Box::new(DeviceAdmission {
+            peer,
+            newly_counted,
+            usage_after,
+            previous_ip,
+        })))
+    }
+
+    pub async fn touch_admitted_device(&self, id: &str) -> ResultType<bool> {
+        let affected = sqlx::query(
+            "UPDATE devices
+             SET status = 'online', last_seen = current_timestamp, is_online = 1,
+                 last_online_at = current_timestamp, updated_at = current_timestamp
+             WHERE device_id = ? AND status IN ('online', 'offline')",
+        )
+        .bind(id)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(affected.rows_affected() == 1)
+    }
+
+    pub async fn mark_startup_online_offline(&self) -> ResultType<u64> {
+        let affected = sqlx::query(
+            "UPDATE devices
+             SET status = 'offline', is_online = 0, updated_at = current_timestamp
+             WHERE status = 'online'",
+        )
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(affected.rows_affected())
+    }
+
+    pub async fn mark_stale_online_offline(&self) -> ResultType<Vec<String>> {
+        self.mark_stale_online_offline_at(Utc::now().naive_utc() - ChronoDuration::seconds(30))
+            .await
+    }
+
+    async fn mark_stale_online_offline_at(&self, cutoff: NaiveDateTime) -> ResultType<Vec<String>> {
+        let rows = sqlx::query(
+            "UPDATE devices
+             SET status = 'offline', is_online = 0, updated_at = current_timestamp
+             WHERE status = 'online' AND last_seen < ?
+             RETURNING device_id",
+        )
+        .bind(cutoff)
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?;
+        rows.into_iter()
+            .map(|row| Ok(row.try_get::<String, _>("device_id")?))
+            .collect()
+    }
+
+    pub async fn mark_stale_offline_inactive(&self) -> ResultType<Vec<String>> {
+        self.mark_stale_offline_inactive_at(Utc::now().naive_utc() - ChronoDuration::days(30))
+            .await
+    }
+
+    async fn mark_stale_offline_inactive_at(
+        &self,
+        cutoff: NaiveDateTime,
+    ) -> ResultType<Vec<String>> {
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        lock_device_quota(&mut tx).await?;
+        let rows = sqlx::query(
+            "UPDATE devices
+             SET status = 'inactive', is_online = 0, updated_at = current_timestamp
+             WHERE status = 'offline' AND last_seen < ?
+             RETURNING device_id",
+        )
+        .bind(cutoff)
+        .fetch_all(&mut tx)
+        .await?;
+        let ids = rows
+            .into_iter()
+            .map(|row| row.try_get::<String, _>("device_id"))
+            .collect::<Result<Vec<_>, _>>()?;
+        tx.commit().await?;
+        Ok(ids)
+    }
+
+    pub async fn set_device_inactive(&self, id: &str) -> ResultType<InactiveUpdate> {
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        lock_device_quota(&mut tx).await?;
+        let status = sqlx::query("SELECT status FROM devices WHERE device_id = ?")
+            .bind(id)
+            .fetch_optional(&mut tx)
+            .await?
+            .map(|row| row.try_get::<String, _>("status"))
+            .transpose()?;
+        let result = match status.as_deref() {
+            None => InactiveUpdate::NotFound,
+            Some("inactive") => InactiveUpdate::AlreadyInactive,
+            Some(_) => {
+                sqlx::query(
+                    "UPDATE devices
+                     SET status = 'inactive', is_online = 0, updated_at = current_timestamp
+                     WHERE device_id = ?",
+                )
+                .bind(id)
+                .execute(&mut tx)
+                .await?;
+                InactiveUpdate::Updated
+            }
+        };
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    pub async fn is_device_inactive(&self, id: &str) -> ResultType<bool> {
+        let row = sqlx::query("SELECT status FROM devices WHERE device_id = ?")
+            .bind(id)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(row
+            .map(|row| row.try_get::<String, _>("status"))
+            .transpose()?
+            .as_deref()
+            == Some("inactive"))
+    }
+
+    pub async fn device_usage(&self) -> ResultType<DeviceUsage> {
+        let rows = sqlx::query("SELECT status, COUNT(*) AS count FROM devices GROUP BY status")
+            .fetch_all(self.pool.get().await?.deref_mut())
+            .await?;
+        let mut usage = DeviceUsage::default();
+        for row in rows {
+            let status = row.try_get::<String, _>("status")?;
+            let count = row.try_get::<i64, _>("count")?.max(0) as u32;
+            match status.as_str() {
+                "online" => usage.online = count,
+                "offline" => usage.offline = count,
+                "inactive" => usage.inactive = count,
+                _ => {}
+            }
+        }
+        Ok(usage)
     }
 
     pub async fn create_user(
@@ -471,6 +796,7 @@ impl Database {
     ) -> ResultType<()> {
         let mut conn = self.pool.get().await?;
         let mut tx = conn.begin().await?;
+        lock_device_quota(&mut tx).await?;
         sqlx::query("UPDATE licenses SET is_active = 0 WHERE is_active = 1")
             .execute(&mut tx)
             .await?;
@@ -519,7 +845,7 @@ impl Database {
     }
 
     pub async fn count_active_devices(&self) -> ResultType<u32> {
-        Ok(0)
+        Ok(self.device_usage().await?.current())
     }
 
     pub async fn get_user_token_version(&self, id: i64) -> ResultType<i64> {
@@ -532,6 +858,40 @@ impl Database {
             None => bail!("user not found"),
         }
     }
+}
+
+async fn lock_device_quota(tx: &mut Transaction<'_, Sqlite>) -> ResultType<()> {
+    sqlx::query("UPDATE device_quota_lock SET version = version + 1 WHERE id = 1")
+        .execute(&mut *tx)
+        .await?;
+    Ok(())
+}
+
+async fn fetch_peer_in_tx(tx: &mut Transaction<'_, Sqlite>, id: &str) -> ResultType<Option<Peer>> {
+    let sql = format!("SELECT {DEVICE_COLUMNS} FROM devices WHERE device_id = ?");
+    Ok(sqlx::query_as::<_, Peer>(&sql)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?)
+}
+
+async fn active_license_key_in_tx(tx: &mut Transaction<'_, Sqlite>) -> ResultType<Option<String>> {
+    let row = sqlx::query(
+        "SELECT license_key FROM licenses WHERE is_active = 1 ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    Ok(row
+        .map(|row| row.try_get::<String, _>("license_key"))
+        .transpose()?)
+}
+
+async fn count_current_devices_in_tx(tx: &mut Transaction<'_, Sqlite>) -> ResultType<u32> {
+    let row =
+        sqlx::query("SELECT COUNT(*) AS count FROM devices WHERE status IN ('online', 'offline')")
+            .fetch_one(&mut *tx)
+            .await?;
+    Ok(row.try_get::<i64, _>("count")?.max(0) as u32)
 }
 
 async fn migrate_legacy_peer_if_exists(conn: &mut SqliteConnection) -> ResultType<()> {
@@ -647,6 +1007,10 @@ mod tests {
             }
             assert!(index_exists(&db, "idx_users_oauth").await.unwrap());
             assert!(index_exists(&db, "idx_users_last_login_at").await.unwrap());
+            assert!(index_exists(&db, "idx_devices_status_last_seen")
+                .await
+                .unwrap());
+            assert!(table_exists(&db, "device_quota_lock").await.unwrap());
 
             cleanup(&path);
         });
@@ -894,6 +1258,306 @@ mod tests {
         });
     }
 
+    #[test]
+    fn test_device_status_check_and_historical_grace_migration() {
+        run(async {
+            let path = temp_db_path("quota-migration");
+            let mut conn = connect(&path).await.unwrap();
+            conn.execute(include_str!(
+                "../migrations/20240101000001_add_core_schema.sql"
+            ))
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO devices(guid, uuid, pk, device_id, info, is_online)
+                 VALUES(?, ?, ?, 'historical-device', '{}', 1)",
+            )
+            .bind(TEST_GUID)
+            .bind(TEST_UUID)
+            .bind(TEST_PK)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            conn.execute(include_str!(
+                "../migrations/20260723000005_add_device_quota.sql"
+            ))
+            .await
+            .unwrap();
+
+            let row = sqlx::query(
+                "SELECT status, is_online,
+                        CAST((julianday('now') - julianday(last_seen)) * 86400 AS INTEGER) AS age
+                 FROM devices WHERE device_id = 'historical-device'",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            assert_eq!(row.try_get::<String, _>("status").unwrap(), "offline");
+            assert_eq!(row.try_get::<i64, _>("is_online").unwrap(), 0);
+            assert!(row.try_get::<i64, _>("age").unwrap().abs() <= 2);
+
+            let invalid = sqlx::query(
+                "UPDATE devices SET status = 'invalid' WHERE device_id = 'historical-device'",
+            )
+            .execute(&mut conn)
+            .await;
+            assert!(invalid.is_err());
+            let index_count = raw_count(
+                &mut conn,
+                "SELECT COUNT(*) AS count FROM sqlite_master
+                 WHERE type='index' AND name='idx_devices_status_last_seen'",
+            )
+            .await
+            .unwrap();
+            assert_eq!(index_count, 1);
+            drop(conn);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_offline_counts_inactive_does_not_and_status_tasks_are_conditional() {
+        run(async {
+            let path = temp_db_path("quota-status");
+            let db = Database::new(&path).await.unwrap();
+            insert_device_with_status(&db, "online-device", "online", 31).await;
+            insert_device_with_status(&db, "offline-device", "offline", 1).await;
+            insert_device_with_status(&db, "inactive-device", "inactive", 40 * 86_400).await;
+
+            let usage = db.device_usage().await.unwrap();
+            assert_eq!(usage.current(), 2);
+            assert_eq!(usage.online, 1);
+            assert_eq!(usage.offline, 1);
+            assert_eq!(usage.inactive, 1);
+
+            let offline = db.mark_stale_online_offline().await.unwrap();
+            assert_eq!(offline, vec!["online-device".to_string()]);
+            set_last_seen_age(&db, "offline-device", 31 * 86_400).await;
+            let inactive = db.mark_stale_offline_inactive().await.unwrap();
+            assert_eq!(inactive, vec!["offline-device".to_string()]);
+            assert_eq!(db.device_usage().await.unwrap().current(), 1);
+
+            sqlx::query(
+                "UPDATE devices SET status='online', is_online=1 WHERE device_id='online-device'",
+            )
+            .execute(db.pool.get().await.unwrap().deref_mut())
+            .await
+            .unwrap();
+            assert_eq!(db.mark_startup_online_offline().await.unwrap(), 1);
+            assert_eq!(
+                db.get_peer("online-device").await.unwrap().unwrap().status,
+                "offline"
+            );
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_quota_new_overuse_existing_reconnect_and_inactive_recheck() {
+        run(async {
+            let path = temp_db_path("quota-admission");
+            let db = Database::new(&path).await.unwrap();
+            insert_test_license(&db, 1).await;
+
+            assert!(matches!(
+                admit_test(&db, "device-one", TEST_UUID, TEST_PK, true).await,
+                DeviceAdmissionResult::Admitted(_)
+            ));
+            assert!(matches!(
+                admit_test(&db, "device-two", b"uuid-two", b"pk-two", true).await,
+                DeviceAdmissionResult::Rejected(DeviceAdmissionFailure::LicenseOveruse {
+                    current: 1,
+                    max: 1
+                })
+            ));
+
+            sqlx::query("UPDATE licenses SET is_active=0")
+                .execute(db.pool.get().await.unwrap().deref_mut())
+                .await
+                .unwrap();
+            assert!(matches!(
+                admit_test(&db, "device-one", TEST_UUID, TEST_PK, true).await,
+                DeviceAdmissionResult::Admitted(_)
+            ));
+            db.set_device_inactive("device-one").await.unwrap();
+            assert!(matches!(
+                admit_test(&db, "device-two", b"uuid-two", b"pk-two", false).await,
+                DeviceAdmissionResult::Admitted(_)
+            ));
+            insert_test_license(&db, 1).await;
+            assert!(matches!(
+                admit_test(&db, "device-one", TEST_UUID, TEST_PK, true).await,
+                DeviceAdmissionResult::Rejected(DeviceAdmissionFailure::LicenseOveruse {
+                    current: 1,
+                    max: 1
+                })
+            ));
+            db.set_device_inactive("device-two").await.unwrap();
+            sqlx::query("UPDATE licenses SET is_active=0")
+                .execute(db.pool.get().await.unwrap().deref_mut())
+                .await
+                .unwrap();
+            assert!(matches!(
+                admit_test(&db, "device-one", TEST_UUID, TEST_PK, true).await,
+                DeviceAdmissionResult::Rejected(DeviceAdmissionFailure::LicenseMismatch)
+            ));
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_two_database_instances_max_one_only_one_admitted() {
+        run(async {
+            let path = temp_db_path("quota-concurrent");
+            let db1 = Database::new(&path).await.unwrap();
+            let db2 = Database::new(&path).await.unwrap();
+            insert_test_license(&db1, 1).await;
+
+            let first = tokio::spawn(async move {
+                admit_test(&db1, "device-a", b"uuid-a", b"pk-a", true).await
+            });
+            let second = tokio::spawn(async move {
+                admit_test(&db2, "device-b", b"uuid-b", b"pk-b", true).await
+            });
+            let results = vec![first.await.unwrap(), second.await.unwrap()];
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|result| matches!(result, DeviceAdmissionResult::Admitted(_)))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|result| matches!(
+                        result,
+                        DeviceAdmissionResult::Rejected(
+                            DeviceAdmissionFailure::LicenseOveruse { .. }
+                        )
+                    ))
+                    .count(),
+                1
+            );
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_license_downscale_and_admission_share_quota_lock() {
+        run(async {
+            let path = temp_db_path("quota-license-race");
+            let db1 = Database::new(&path).await.unwrap();
+            let db2 = Database::new(&path).await.unwrap();
+            insert_test_license(&db1, 1).await;
+
+            let admission_db = db1.clone();
+            let admission = tokio::spawn(async move {
+                admit_test(&admission_db, "race-device", b"race-uuid", b"race-pk", true).await
+            });
+            let downscale = tokio::spawn(async move {
+                db2.upsert_license("TEST-0", 0, None, 0, None)
+                    .await
+                    .unwrap();
+            });
+            let result = admission.await.unwrap();
+            downscale.await.unwrap();
+
+            let verifier = Database::new(&path).await.unwrap();
+            assert_eq!(
+                verifier.get_active_license_key().await.unwrap().as_deref(),
+                Some("TEST-0")
+            );
+            match result {
+                DeviceAdmissionResult::Admitted(_) => {
+                    assert_eq!(verifier.device_usage().await.unwrap().current(), 1)
+                }
+                DeviceAdmissionResult::Rejected(DeviceAdmissionFailure::LicenseOveruse {
+                    current: 0,
+                    max: 0,
+                }) => assert_eq!(verifier.device_usage().await.unwrap().current(), 0),
+                other => panic!("unexpected race result: {other:?}"),
+            }
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_cancelled_lock_wait_leaves_connection_reusable() {
+        run(async {
+            let path = temp_db_path("quota-cancelled-lock");
+            let holder_db = Database::new(&path).await.unwrap();
+            let waiting_db = Database::new(&path).await.unwrap();
+
+            let mut holder = holder_db.pool.get().await.unwrap();
+            let mut holder_tx = holder.begin().await.unwrap();
+            lock_device_quota(&mut holder_tx).await.unwrap();
+
+            let cancelled_db = waiting_db.clone();
+            let waiting = tokio::spawn(async move {
+                admit_test(
+                    &cancelled_db,
+                    "cancelled-device",
+                    b"cancelled-uuid",
+                    b"cancelled-pk",
+                    false,
+                )
+                .await
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            waiting.abort();
+            assert!(waiting.await.unwrap_err().is_cancelled());
+            holder_tx.rollback().await.unwrap();
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                admit_test(
+                    &waiting_db,
+                    "reusable-device",
+                    b"reusable-uuid",
+                    b"reusable-pk",
+                    false,
+                ),
+            )
+            .await
+            .expect("cancelled transaction must not poison pooled connection");
+            assert!(matches!(result, DeviceAdmissionResult::Admitted(_)));
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_busy_timeout_is_database_error_not_overuse() {
+        run(async {
+            let path = temp_db_path("quota-busy-timeout");
+            let holder_db = Database::new(&path).await.unwrap();
+            let waiting_db = Database::new(&path).await.unwrap();
+            let mut holder = holder_db.pool.get().await.unwrap();
+            let mut holder_tx = holder.begin().await.unwrap();
+            lock_device_quota(&mut holder_tx).await.unwrap();
+
+            let result = waiting_db
+                .admit_device_with_parser(
+                    "busy-device",
+                    b"busy-uuid",
+                    b"busy-pk",
+                    "{\"ip\":\"127.0.0.1\"}",
+                    "127.0.0.1",
+                    false,
+                    parse_test_license,
+                )
+                .await;
+            assert!(result.is_err());
+            holder_tx.rollback().await.unwrap();
+
+            assert!(matches!(
+                admit_test(&waiting_db, "busy-device", b"busy-uuid", b"busy-pk", false).await,
+                DeviceAdmissionResult::Admitted(_)
+            ));
+            cleanup(&path);
+        });
+    }
+
     fn run<F>(future: F)
     where
         F: std::future::Future<Output = ()>,
@@ -1006,6 +1670,92 @@ mod tests {
         .execute(&mut conn)
         .await?;
         Ok(())
+    }
+
+    async fn insert_device_with_status(db: &Database, id: &str, status: &str, age_seconds: i64) {
+        let guid = uuid::Uuid::new_v4().as_bytes().to_vec();
+        let uuid = format!("uuid-{id}");
+        let pk = format!("pk-{id}");
+        sqlx::query(
+            "INSERT INTO devices(
+                guid, uuid, pk, device_id, info, status, last_seen, is_online
+             ) VALUES(?, ?, ?, ?, '{}', ?, datetime('now', ?), ?)",
+        )
+        .bind(guid)
+        .bind(uuid.as_bytes())
+        .bind(pk.as_bytes())
+        .bind(id)
+        .bind(status)
+        .bind(format!("-{age_seconds} seconds"))
+        .bind(status == "online")
+        .execute(db.pool.get().await.unwrap().deref_mut())
+        .await
+        .unwrap();
+    }
+
+    async fn set_last_seen_age(db: &Database, id: &str, age_seconds: i64) {
+        sqlx::query("UPDATE devices SET last_seen=datetime('now', ?) WHERE device_id=?")
+            .bind(format!("-{age_seconds} seconds"))
+            .bind(id)
+            .execute(db.pool.get().await.unwrap().deref_mut())
+            .await
+            .unwrap();
+    }
+
+    async fn insert_test_license(db: &Database, max_devices: u32) {
+        let key = format!("TEST-{max_devices}");
+        let mut conn = db.pool.get().await.unwrap();
+        sqlx::query("UPDATE licenses SET is_active=0")
+            .execute(conn.deref_mut())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO licenses(license_key, device_limit, is_active)
+             VALUES(?, ?, 1)
+             ON CONFLICT(license_key) DO UPDATE SET device_limit=excluded.device_limit, is_active=1",
+        )
+        .bind(key)
+        .bind(i64::from(max_devices))
+        .execute(conn.deref_mut())
+        .await
+        .unwrap();
+    }
+
+    fn parse_test_license(
+        key: &str,
+    ) -> Result<crate::license::License, crate::license::LicenseError> {
+        let max_devices = key
+            .strip_prefix("TEST-")
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or_else(|| crate::license::LicenseError::InvalidFormat("test license".into()))?;
+        Ok(crate::license::License {
+            issued_to: "test".to_string(),
+            max_devices,
+            max_users: 1,
+            features: 0,
+            issued_at: 1,
+            expires_at: crate::license::now_timestamp() + 3600,
+        })
+    }
+
+    async fn admit_test(
+        db: &Database,
+        id: &str,
+        uuid: &[u8],
+        pk: &[u8],
+        pro_enabled: bool,
+    ) -> DeviceAdmissionResult {
+        db.admit_device_with_parser(
+            id,
+            uuid,
+            pk,
+            "{\"ip\":\"127.0.0.1\"}",
+            "127.0.0.1",
+            pro_enabled,
+            parse_test_license,
+        )
+        .await
+        .unwrap()
     }
 
     async fn table_exists(db: &Database, table: &str) -> ResultType<bool> {

@@ -9,5 +9,9 @@ pub mod license;
 mod license_proto;
 pub mod models;
 mod peer;
+pub use peer::{
+    DeviceInvalidationCommand, DeviceInvalidationReceiver, DeviceInvalidationSender,
+    InvalidationResult,
+};
 pub mod pubkey;
 mod version;

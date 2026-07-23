@@ -7,7 +7,9 @@ pub mod oidc;
 pub mod users;
 pub mod version;
 
-use crate::{auth::AuthState, config::OidcConfig, database::Database};
+use crate::{
+    auth::AuthState, config::OidcConfig, database::Database, peer::DeviceInvalidationSender,
+};
 use axum::{
     http::StatusCode,
     routing::{any, get, post},
@@ -18,7 +20,12 @@ use serde_json::{json, Value};
 use std::{net::SocketAddr, sync::mpsc::Sender};
 use tower::ServiceBuilder;
 
-pub fn build_router(db: Database, auth_state: AuthState, oidc_config: OidcConfig) -> Router {
+pub fn build_router(
+    db: Database,
+    auth_state: AuthState,
+    oidc_config: OidcConfig,
+    device_control_tx: DeviceInvalidationSender,
+) -> Router {
     let protected_router = Router::new()
         .route("/api/auth/logout", post(auth::handle_logout))
         .route(
@@ -34,9 +41,14 @@ pub fn build_router(db: Database, auth_state: AuthState, oidc_config: OidcConfig
         .route("/api/license/status", get(license::handle_license_status))
         .route("/api/license/usage", get(license::handle_license_usage))
         .route("/api/license/upload", post(license::handle_license_upload))
+        .route(
+            "/api/license/devices/:device_id/inactive",
+            post(license::handle_device_inactive),
+        )
         .layer(
             ServiceBuilder::new()
                 .layer(Extension(db.clone()))
+                .layer(Extension(device_control_tx.clone()))
                 .layer(Extension(auth_state.clone()))
                 .layer(Extension(oidc_config.clone()))
                 .layer(axum::middleware::from_fn(middleware::auth_layer)),
@@ -53,6 +65,7 @@ pub fn build_router(db: Database, auth_state: AuthState, oidc_config: OidcConfig
         .layer(
             ServiceBuilder::new()
                 .layer(Extension(db))
+                .layer(Extension(device_control_tx))
                 .layer(Extension(auth_state))
                 .layer(Extension(oidc_config.clone())),
         )
@@ -68,6 +81,7 @@ pub fn api_server_forever(
     db_url: String,
     auth_state: AuthState,
     oidc_config: OidcConfig,
+    device_control_tx: DeviceInvalidationSender,
 ) {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -100,7 +114,7 @@ pub fn api_server_forever(
             log::warn!("许可证加载失败，Pro 模式新连接将被拒绝: {}", err);
         }
 
-        let app = build_router(db, auth_state, oidc_config);
+        let app = build_router(db, auth_state, oidc_config, device_control_tx);
         log::info!("API server binding to {}", addr);
         match axum::Server::try_bind(&addr) {
             Ok(server) => {
@@ -138,13 +152,18 @@ mod tests {
     };
     use tower::ServiceExt;
 
+    fn build_test_router(db: Database, auth_state: AuthState, oidc_config: OidcConfig) -> Router {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        build_router(db, auth_state, oidc_config, tx)
+    }
+
     #[test]
     fn test_build_router() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let path = temp_db_path("api-build-router");
             let db = Database::new(&path).await.unwrap();
-            let _app = build_router(db, test_auth_state(), test_oidc_config());
+            let _app = build_test_router(db, test_auth_state(), test_oidc_config());
             cleanup(&path);
         });
     }
@@ -155,7 +174,7 @@ mod tests {
         rt.block_on(async {
             let path = temp_db_path("api-health");
             let db = Database::new(&path).await.unwrap();
-            let response = build_router(db, test_auth_state(), test_oidc_config())
+            let response = build_test_router(db, test_auth_state(), test_oidc_config())
                 .oneshot(
                     Request::builder()
                         .uri("/api/health")
@@ -179,7 +198,7 @@ mod tests {
         rt.block_on(async {
             let path = temp_db_path("api-404");
             let db = Database::new(&path).await.unwrap();
-            let response = build_router(db, test_auth_state(), test_oidc_config())
+            let response = build_test_router(db, test_auth_state(), test_oidc_config())
                 .oneshot(
                     Request::builder()
                         .uri("/api/does-not-exist")
@@ -198,6 +217,170 @@ mod tests {
     }
 
     #[test]
+    fn test_license_usage_requires_admin_and_returns_status_breakdown() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("license-usage");
+            let db = Database::new(&path).await.unwrap();
+            let password_hash = admin_init::hash_password("secret").unwrap();
+            db.create_user("admin", &password_hash, None, "admin")
+                .await
+                .unwrap();
+            db.create_user("ordinary", &password_hash, None, "user")
+                .await
+                .unwrap();
+            db.insert_peer("usage-online", b"uuid-1", b"pk-1", "{}")
+                .await
+                .unwrap();
+            db.insert_peer("usage-inactive", b"uuid-2", b"pk-2", "{}")
+                .await
+                .unwrap();
+            db.set_device_inactive("usage-inactive").await.unwrap();
+            let app = build_test_router(db, test_auth_state(), test_oidc_config());
+
+            let unauthorized = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/license/usage")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+            let user_token = login_access_token(&app, "ordinary", "secret").await;
+            let forbidden = app
+                .clone()
+                .oneshot(authenticated_request(
+                    "GET",
+                    "/api/license/usage",
+                    &user_token,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+            let admin_token = login_access_token(&app, "admin", "secret").await;
+            let response = app
+                .oneshot(authenticated_request(
+                    "GET",
+                    "/api/license/usage",
+                    &admin_token,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value =
+                serde_json::from_slice(&read_body(response.into_body()).await).unwrap();
+            assert_eq!(body["online_devices"], 0);
+            assert_eq!(body["offline_devices"], 1);
+            assert_eq!(body["inactive_devices"], 1);
+            assert_eq!(body["current_devices"], 1);
+            assert!(body.get("expires_at").is_some());
+            assert!(body.get("days_remaining").is_some());
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_device_inactive_503_is_retryable_and_retry_resends_command() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("device-inactive-retry");
+            let db = Database::new(&path).await.unwrap();
+            let password_hash = admin_init::hash_password("secret").unwrap();
+            db.create_user("admin", &password_hash, None, "admin")
+                .await
+                .unwrap();
+            db.insert_peer("device-retry", b"uuid", b"pk", "{}")
+                .await
+                .unwrap();
+
+            let (closed_tx, closed_rx) = tokio::sync::mpsc::unbounded_channel();
+            drop(closed_rx);
+            let failed_app =
+                build_router(db.clone(), test_auth_state(), test_oidc_config(), closed_tx);
+            let token = login_access_token(&failed_app, "admin", "secret").await;
+            let failed = failed_app
+                .oneshot(authenticated_request(
+                    "POST",
+                    "/api/license/devices/device-retry/inactive",
+                    &token,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let failed_body: Value =
+                serde_json::from_slice(&read_body(failed.into_body()).await).unwrap();
+            assert_eq!(failed_body["database_inactive_committed"], true);
+            assert_eq!(failed_body["retryable"], true);
+            assert!(db.is_device_inactive("device-retry").await.unwrap());
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let retry_app = build_router(db, test_auth_state(), test_oidc_config(), tx);
+            let controller = tokio::spawn(async move {
+                let command = rx.recv().await.unwrap();
+                assert_eq!(command.device_id, "device-retry");
+                command
+                    .ack
+                    .send(Ok(crate::peer::InvalidationResult::AlreadyAbsent))
+                    .unwrap();
+            });
+            let retried = retry_app
+                .oneshot(authenticated_request(
+                    "POST",
+                    "/api/license/devices/device-retry/inactive",
+                    &token,
+                ))
+                .await
+                .unwrap();
+            controller.await.unwrap();
+            assert_eq!(retried.status(), StatusCode::OK);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn test_device_inactive_ack_timeout_is_two_seconds() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("device-inactive-timeout");
+            let db = Database::new(&path).await.unwrap();
+            let password_hash = admin_init::hash_password("secret").unwrap();
+            db.create_user("admin", &password_hash, None, "admin")
+                .await
+                .unwrap();
+            db.insert_peer("device-timeout", b"uuid", b"pk", "{}")
+                .await
+                .unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let app = build_router(db, test_auth_state(), test_oidc_config(), tx);
+            let token = login_access_token(&app, "admin", "secret").await;
+            let controller = tokio::spawn(async move {
+                let command = rx.recv().await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                drop(command);
+            });
+            let started = std::time::Instant::now();
+            let response = app
+                .oneshot(authenticated_request(
+                    "POST",
+                    "/api/license/devices/device-timeout/inactive",
+                    &token,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+            assert!(started.elapsed() < std::time::Duration::from_secs(3));
+            controller.abort();
+            cleanup(&path);
+        });
+    }
+
+    #[test]
     fn test_login_refresh_and_logout_flow() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -208,7 +391,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let app = build_router(db, test_auth_state(), test_oidc_config());
+            let app = build_test_router(db, test_auth_state(), test_oidc_config());
             let login_response = app
                 .clone()
                 .oneshot(json_request(
@@ -300,7 +483,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let app = build_router(db, test_auth_state(), test_oidc_config());
+            let app = build_test_router(db, test_auth_state(), test_oidc_config());
             let cookie_header = login_cookie_header(&app).await;
             let response = app
                 .oneshot(
@@ -464,7 +647,7 @@ mod tests {
         rt.block_on(async {
             let path = temp_db_path("api-oidc-login-not-configured");
             let db = Database::new(&path).await.unwrap();
-            let response = build_router(db, test_auth_state(), test_oidc_config())
+            let response = build_test_router(db, test_auth_state(), test_oidc_config())
                 .oneshot(
                     Request::builder()
                         .method("GET")
@@ -493,7 +676,7 @@ mod tests {
                 post_login_url: "https://console.example.com/dashboard".to_string(),
                 ..OidcConfig::default()
             };
-            let response = build_router(db, test_auth_state(), oidc_config)
+            let response = build_test_router(db, test_auth_state(), oidc_config)
                 .oneshot(
                     Request::builder()
                         .method("GET")
@@ -519,7 +702,7 @@ mod tests {
         rt.block_on(async {
             let path = temp_db_path("api-oidc-callback-missing-params");
             let db = Database::new(&path).await.unwrap();
-            let response = build_router(db, test_auth_state(), test_configured_oidc_config())
+            let response = build_test_router(db, test_auth_state(), test_configured_oidc_config())
                 .oneshot(
                     Request::builder()
                         .method("GET")
@@ -541,7 +724,7 @@ mod tests {
         rt.block_on(async {
             let path = temp_db_path("api-oidc-callback-invalid-state");
             let db = Database::new(&path).await.unwrap();
-            let response = build_router(db, test_auth_state(), test_configured_oidc_config())
+            let response = build_test_router(db, test_auth_state(), test_configured_oidc_config())
                 .oneshot(
                     Request::builder()
                         .method("GET")
@@ -570,7 +753,7 @@ mod tests {
                 "nonce".to_string(),
             );
             let uri = format!("/api/auth/oidc/callback?code=abc&state={state}");
-            let response = build_router(db, test_auth_state(), test_configured_oidc_config())
+            let response = build_test_router(db, test_auth_state(), test_configured_oidc_config())
                 .oneshot(
                     Request::builder()
                         .method("GET")
@@ -644,7 +827,7 @@ mod tests {
         db.create_user("admin", &password_hash, None, "admin")
             .await
             .unwrap();
-        let app = build_router(db, test_auth_state(), test_cross_origin_oidc_config());
+        let app = build_test_router(db, test_auth_state(), test_cross_origin_oidc_config());
         let cookie_header = login_cookie_header(&app).await;
         (app, cookie_header, path)
     }
@@ -683,6 +866,29 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(value.to_string()))
             .unwrap()
+    }
+
+    fn authenticated_request(method: &str, uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn login_access_token(app: &Router, username: &str, password: &str) -> String {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "/api/auth/login",
+                json!({ "username": username, "password": password }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(&read_body(response.into_body()).await).unwrap();
+        body["access_token"].as_str().unwrap().to_string()
     }
 
     fn temp_db_path(name: &str) -> String {
