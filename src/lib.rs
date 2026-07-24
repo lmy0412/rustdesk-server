@@ -10,8 +10,8 @@ mod license_proto;
 pub mod models;
 mod peer;
 pub use peer::{
-    DeviceInvalidationCommand, DeviceInvalidationReceiver, DeviceInvalidationSender,
-    InvalidationResult,
+    DeviceInvalidationCommand, DeviceInvalidationPredicate, DeviceInvalidationReceiver,
+    DeviceInvalidationSender, InvalidationResult, DEVICE_INVALIDATION_CHANNEL_CAPACITY,
 };
 pub mod pubkey;
 mod version;

@@ -44,7 +44,8 @@ fn main() -> ResultType<()> {
         std::process::exit(1);
     });
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-    let (device_control_tx, device_control_rx) = hbb_common::tokio::sync::mpsc::unbounded_channel();
+    let (device_control_tx, device_control_rx) =
+        hbb_common::tokio::sync::mpsc::channel(DEVICE_INVALIDATION_CHANNEL_CAPACITY);
     let db_url = config.server.db_path.clone();
     let auth_state = AuthState::from_config(&config.pro);
     let oidc_config = config.pro.oidc.clone();

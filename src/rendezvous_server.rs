@@ -282,14 +282,7 @@ impl RendezvousServer {
         loop {
             tokio::select! {
                 Some(command) = device_rx.recv() => {
-                    let result = match self.pm.invalidate_if_still_inactive(&command.device_id).await {
-                        Ok(result) => Ok(result),
-                        Err(err) => {
-                            log::error!("处理设备 {} 缓存失效命令失败: {:#}", command.device_id, err);
-                            Err(())
-                        }
-                    };
-                    let _ = command.ack.send(result);
+                    self.handle_device_invalidation_command(command).await;
                 }
                 _ = timer_offline.tick() => {
                     if let Err(err) = self.pm.db.mark_stale_online_offline().await {
@@ -379,6 +372,22 @@ impl RendezvousServer {
                 }
             }
         }
+    }
+
+    async fn handle_device_invalidation_command(&self, command: DeviceInvalidationCommand) {
+        let DeviceInvalidationCommand {
+            device_id,
+            predicate,
+            ack,
+        } = command;
+        let result = match self.pm.invalidate(&device_id, predicate).await {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                log::error!("处理设备 {} 缓存失效命令失败: {:#}", device_id, err);
+                Err(())
+            }
+        };
+        let _ = ack.send(result);
     }
 
     #[inline]
@@ -640,9 +649,15 @@ impl RendezvousServer {
                 {
                     self.record_ip_change(&id, &ip).await;
                 }
-                self.pm
+                if self
+                    .pm
                     .insert_admitted(id.clone(), admission.peer, addr, transferred_reg_pk)
-                    .await;
+                    .await
+                    .is_none()
+                {
+                    log::warn!("设备 {} 的准入结果在写入缓存前已失效，请客户端重试", id);
+                    return RegistrationResult::ServerError;
+                }
                 if admission.newly_counted {
                     if let Some((current, max)) = admission.usage_after {
                         license::log_quota_usage_event("设备准入", current, max);
@@ -698,7 +713,7 @@ impl RendezvousServer {
         socket_addr: SocketAddr,
     ) -> (bool, Option<String>) {
         let (request_pk, ip_change) = if let Some(old) = self.pm.get_in_memory(id).await {
-            let (ip_change, previous, expired) = {
+            let (ip_change, previous, expired, expected_guid) = {
                 let old = old.read().await;
                 let ip = socket_addr.ip();
                 let ip_change = (if old.socket_addr.port() != 0 {
@@ -715,12 +730,13 @@ impl RendezvousServer {
                     ip_change,
                     previous,
                     old.last_reg_time.elapsed().as_millis() as i32 >= REG_TIMEOUT,
+                    old.guid.clone(),
                 )
             };
             if ip_change {
                 (true, Some(previous))
             } else {
-                match self.pm.db.touch_admitted_device(id).await {
+                match self.pm.db.touch_admitted_device(id, &expected_guid).await {
                     Ok(true) => {
                         let mut old = old.write().await;
                         old.socket_addr = socket_addr;
@@ -728,7 +744,9 @@ impl RendezvousServer {
                         (false, None)
                     }
                     Ok(false) => {
-                        if let Err(err) = self.pm.invalidate_if_still_inactive(id).await {
+                        if let Err(err) =
+                            self.pm.invalidate_if_not_admitted(id, &expected_guid).await
+                        {
                             log::error!("心跳发现设备 {} 未准入，缓存失效失败: {:#}", id, err);
                         }
                         (true, None)
@@ -1713,6 +1731,38 @@ mod tests {
     }
 
     #[test]
+    fn still_inactive_command_consumer_preserves_issue_7_behavior() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("still-inactive-command");
+            let db = Database::new(&path).await.unwrap();
+            db.insert_peer("device-command", b"uuid", b"pk", "{}")
+                .await
+                .unwrap();
+            let server = test_server(db.clone(), false);
+            server
+                .pm
+                .get_for_rendezvous("device-command")
+                .await
+                .unwrap();
+            db.set_device_inactive("device-command").await.unwrap();
+
+            let (ack, result) = tokio::sync::oneshot::channel();
+            server
+                .handle_device_invalidation_command(DeviceInvalidationCommand {
+                    device_id: "device-command".to_string(),
+                    predicate: DeviceInvalidationPredicate::StillInactive,
+                    ack,
+                })
+                .await;
+
+            assert_eq!(result.await.unwrap().unwrap(), InvalidationResult::Removed);
+            assert!(server.pm.get_in_memory("device-command").await.is_none());
+            cleanup(&path);
+        });
+    }
+
+    #[test]
     fn heartbeat_database_failure_never_refreshes_memory_window() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -1748,6 +1798,59 @@ mod tests {
             let (request_pk, _) = server.refresh_addr_state("device-heartbeat", addr).await;
             assert!(request_pk);
             assert_eq!(peer.read().await.last_reg_time, expired);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn heartbeat_guid_change_invalidates_old_arc() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("heartbeat-guid-change");
+            let db = Database::new(&path).await.unwrap();
+            let mut server = test_server(db.clone(), false);
+            let addr: SocketAddr = "127.0.0.1:30410".parse().unwrap();
+            assert_eq!(
+                server
+                    .register_pk(
+                        RegisterPk {
+                            id: "device-guid-change".to_string(),
+                            uuid: Bytes::from_static(b"uuid-old"),
+                            pk: Bytes::from_static(b"pk-old"),
+                            ..Default::default()
+                        },
+                        addr,
+                    )
+                    .await,
+                RegistrationResult::Ok
+            );
+            let old = server.pm.get_in_memory("device-guid-change").await.unwrap();
+
+            let mut conn = SqliteConnection::connect(&path).await.unwrap();
+            conn.execute("DELETE FROM devices WHERE device_id = 'device-guid-change'")
+                .await
+                .unwrap();
+            drop(conn);
+            let new_guid = db
+                .insert_peer("device-guid-change", b"uuid-new", b"pk-new", "{}")
+                .await
+                .unwrap();
+
+            let (request_pk, _) = server.refresh_addr_state("device-guid-change", addr).await;
+            assert!(request_pk);
+            assert!(server
+                .pm
+                .get_in_memory("device-guid-change")
+                .await
+                .is_none());
+
+            let current = server
+                .pm
+                .get_for_rendezvous("device-guid-change")
+                .await
+                .unwrap();
+            assert_eq!(current.read().await.guid, new_guid);
+            assert!(!Arc::ptr_eq(&old, &current));
             cleanup(&path);
         });
     }

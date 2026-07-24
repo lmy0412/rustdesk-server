@@ -10,9 +10,13 @@ use std::{ops::DerefMut, str::FromStr, time::Duration};
 //use sqlx::postgres::PgPoolOptions;
 //use sqlx::mysql::MySqlPoolOptions;
 
+mod inventory;
+
+pub use inventory::*;
+
 type Pool = deadpool::managed::Pool<DbPool>;
 const USER_COLUMNS: &str = "id, username, password_hash, email, role, is_active, token_version, oauth_provider, oauth_subject, last_login_at, created_at, updated_at";
-const DEVICE_COLUMNS: &str = "guid, device_id AS id, uuid, pk, CAST(NULL AS BLOB) AS user, info, status, last_seen, note, owner_user_id, group_id, features, token_version";
+const DEVICE_COLUMNS: &str = "guid, device_id AS id, uuid, pk, CAST(NULL AS BLOB) AS user, info, status, last_seen, note, owner_user_id, group_id, features, token_version, management_generation";
 
 pub struct DbPool {
     url: String,
@@ -25,6 +29,7 @@ impl deadpool::managed::Manager for DbPool {
     async fn create(&self) -> Result<SqliteConnection, SqlxError> {
         let mut opt = SqliteConnectOptions::from_str(&self.url).unwrap();
         opt = opt.busy_timeout(Duration::from_secs(2));
+        opt = opt.foreign_keys(true);
         opt.log_statements(log::LevelFilter::Debug);
         SqliteConnection::connect_with(&opt).await
     }
@@ -56,6 +61,7 @@ pub struct Peer {
     pub group_id: Option<i64>,
     pub features: Option<String>,
     pub token_version: i64,
+    pub management_generation: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,7 +169,9 @@ impl Database {
         sqlx::migrate!().run(conn.deref_mut()).await?;
         ensure_users_token_version_column(conn.deref_mut()).await?;
         migrate_legacy_peer_if_exists(conn.deref_mut()).await?;
+        verify_inventory_integrity(conn.deref_mut()).await?;
         log::info!("Database migrations complete");
+        drop(conn);
         let db = Database { pool };
         Ok(db)
     }
@@ -366,14 +374,15 @@ impl Database {
         })))
     }
 
-    pub async fn touch_admitted_device(&self, id: &str) -> ResultType<bool> {
+    pub async fn touch_admitted_device(&self, id: &str, expected_guid: &[u8]) -> ResultType<bool> {
         let affected = sqlx::query(
             "UPDATE devices
              SET status = 'online', last_seen = current_timestamp, is_online = 1,
                  last_online_at = current_timestamp, updated_at = current_timestamp
-             WHERE device_id = ? AND status IN ('online', 'offline')",
+             WHERE device_id = ? AND guid = ? AND status IN ('online', 'offline')",
         )
         .bind(id)
+        .bind(expected_guid)
         .execute(self.pool.get().await?.deref_mut())
         .await?;
         Ok(affected.rows_affected() == 1)
