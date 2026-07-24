@@ -1,5 +1,9 @@
+pub mod access;
 pub mod admin_init;
 pub mod auth;
+pub mod device_deletion;
+pub mod devices;
+pub mod groups;
 pub mod health;
 pub mod license;
 pub mod middleware;
@@ -7,6 +11,8 @@ pub mod oidc;
 pub mod users;
 pub mod version;
 
+#[cfg(test)]
+use crate::peer::DEVICE_INVALIDATION_CHANNEL_CAPACITY;
 use crate::{
     auth::AuthState, config::OidcConfig, database::Database, peer::DeviceInvalidationSender,
 };
@@ -19,6 +25,7 @@ use hbb_common::log;
 use serde_json::{json, Value};
 use std::{net::SocketAddr, sync::mpsc::Sender};
 use tower::ServiceBuilder;
+use tower_http::limit::RequestBodyLimitLayer;
 
 pub fn build_router(
     db: Database,
@@ -26,6 +33,36 @@ pub fn build_router(
     oidc_config: OidcConfig,
     device_control_tx: DeviceInvalidationSender,
 ) -> Router {
+    device_deletion::spawn_dispatcher(db.clone(), device_control_tx.clone());
+
+    let inventory_router = Router::new()
+        .route(
+            "/api/groups",
+            get(groups::handle_list_groups).post(groups::handle_create_group),
+        )
+        .route(
+            "/api/groups/:id",
+            get(groups::handle_get_group)
+                .put(groups::handle_update_group)
+                .delete(groups::handle_delete_group),
+        )
+        .route(
+            "/api/groups/:id/devices",
+            post(groups::handle_add_group_devices).delete(groups::handle_remove_group_devices),
+        )
+        .route("/api/devices", get(devices::handle_list_devices))
+        .route("/api/devices/batch-tag", post(devices::handle_batch_tag))
+        .route(
+            "/api/devices/:id",
+            get(devices::handle_get_device)
+                .put(devices::handle_update_device)
+                .delete(devices::handle_delete_device),
+        )
+        .layer(RequestBodyLimitLayer::new(256 * 1024))
+        .layer(axum::middleware::from_fn(
+            access::require_inventory_write_access,
+        ));
+
     let protected_router = Router::new()
         .route("/api/auth/logout", post(auth::handle_logout))
         .route(
@@ -45,6 +82,7 @@ pub fn build_router(
             "/api/license/devices/:device_id/inactive",
             post(license::handle_device_inactive),
         )
+        .merge(inventory_router)
         .layer(
             ServiceBuilder::new()
                 .layer(Extension(db.clone()))
@@ -153,7 +191,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn build_test_router(db: Database, auth_state: AuthState, oidc_config: OidcConfig) -> Router {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::channel(DEVICE_INVALIDATION_CHANNEL_CAPACITY);
         build_router(db, auth_state, oidc_config, tx)
     }
 
@@ -298,7 +336,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            let (closed_tx, closed_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (closed_tx, closed_rx) =
+                tokio::sync::mpsc::channel(DEVICE_INVALIDATION_CHANNEL_CAPACITY);
             drop(closed_rx);
             let failed_app =
                 build_router(db.clone(), test_auth_state(), test_oidc_config(), closed_tx);
@@ -318,7 +357,7 @@ mod tests {
             assert_eq!(failed_body["retryable"], true);
             assert!(db.is_device_inactive("device-retry").await.unwrap());
 
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(DEVICE_INVALIDATION_CHANNEL_CAPACITY);
             let retry_app = build_router(db, test_auth_state(), test_oidc_config(), tx);
             let controller = tokio::spawn(async move {
                 let command = rx.recv().await.unwrap();
@@ -355,7 +394,7 @@ mod tests {
             db.insert_peer("device-timeout", b"uuid", b"pk", "{}")
                 .await
                 .unwrap();
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(DEVICE_INVALIDATION_CHANNEL_CAPACITY);
             let app = build_router(db, test_auth_state(), test_oidc_config(), tx);
             let token = login_access_token(&app, "admin", "secret").await;
             let controller = tokio::spawn(async move {

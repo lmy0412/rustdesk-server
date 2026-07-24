@@ -10,8 +10,12 @@ use serde_derive::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     collections::HashSet,
+    future::Future,
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -40,6 +44,7 @@ pub(crate) struct PeerInfo {
 pub(crate) struct Peer {
     pub(crate) socket_addr: SocketAddr,
     pub(crate) last_reg_time: Instant,
+    pub(crate) guid: Vec<u8>,
     pub(crate) uuid: Bytes,
     pub(crate) pk: Bytes,
     // pub(crate) user: Option<Vec<u8>>,
@@ -54,6 +59,7 @@ impl Default for Peer {
         Self {
             socket_addr: "0.0.0.0:0".parse().unwrap(),
             last_reg_time: get_expired_time(),
+            guid: Vec::new(),
             uuid: Bytes::new(),
             pk: Bytes::new(),
             info: Default::default(),
@@ -73,15 +79,24 @@ pub enum InvalidationResult {
     AlreadyAbsent,
     Replaced,
     NoLongerInactive,
+    GenerationStillPresent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceInvalidationPredicate {
+    StillInactive,
+    DeletedGeneration { guid: Vec<u8> },
 }
 
 pub struct DeviceInvalidationCommand {
     pub device_id: String,
+    pub predicate: DeviceInvalidationPredicate,
     pub ack: oneshot::Sender<Result<InvalidationResult, ()>>,
 }
 
-pub type DeviceInvalidationSender = mpsc::UnboundedSender<DeviceInvalidationCommand>;
-pub type DeviceInvalidationReceiver = mpsc::UnboundedReceiver<DeviceInvalidationCommand>;
+pub const DEVICE_INVALIDATION_CHANNEL_CAPACITY: usize = 1_024;
+pub type DeviceInvalidationSender = mpsc::Sender<DeviceInvalidationCommand>;
+pub type DeviceInvalidationReceiver = mpsc::Receiver<DeviceInvalidationCommand>;
 
 #[derive(Debug, Clone, Copy)]
 struct PendingRegistration {
@@ -165,8 +180,64 @@ fn normalize_pending_key(device_id: &str, source_ip: &str) -> (String, String) {
 
 #[derive(Clone)]
 pub(crate) struct PeerMap {
-    map: Arc<RwLock<HashMap<String, LockPeer>>>,
+    state: Arc<RwLock<PeerMapState>>,
     pub(crate) db: database::Database,
+}
+
+#[derive(Default)]
+struct PeerMapState {
+    peers: HashMap<String, LockPeer>,
+    epochs: Arc<StdMutex<HashMap<String, Arc<AtomicU64>>>>,
+}
+
+struct EpochLease {
+    epochs: Arc<StdMutex<HashMap<String, Arc<AtomicU64>>>>,
+    id: String,
+    token: Arc<AtomicU64>,
+    captured_epoch: u64,
+}
+
+impl EpochLease {
+    fn acquire(state: &PeerMapState, id: &str) -> Self {
+        let epochs = state.epochs.clone();
+        let token = {
+            let mut registry = epochs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry
+                .entry(id.to_owned())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                .clone()
+        };
+        let captured_epoch = token.load(Ordering::Acquire);
+        Self {
+            epochs,
+            id: id.to_owned(),
+            token,
+            captured_epoch,
+        }
+    }
+
+    fn has_advanced(&self) -> bool {
+        self.token.load(Ordering::Acquire) != self.captured_epoch
+    }
+}
+
+impl Drop for EpochLease {
+    fn drop(&mut self) {
+        // future 在数据库或其他 await 点被取消时也会走 Drop；同步短锁让 token
+        // 无需依赖异步清理任务，且 Arc 指针校验可隔离同一设备后续创建的新 token。
+        let mut registry = self
+            .epochs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let is_last_lease = registry.get(&self.id).is_some_and(|current| {
+            Arc::ptr_eq(current, &self.token) && Arc::strong_count(&self.token) == 2
+        });
+        if is_last_lease {
+            registry.remove(&self.id);
+        }
+    }
 }
 
 impl PeerMap {
@@ -174,7 +245,7 @@ impl PeerMap {
         let db = selected_db_path(std::env::var("DB_URL").ok(), configured_db_path());
         log::info!("DB_URL={}", db);
         let pm = Self {
-            map: Default::default(),
+            state: Default::default(),
             db: database::Database::new(&db).await?,
         };
         Ok(pm)
@@ -183,34 +254,112 @@ impl PeerMap {
     #[cfg(test)]
     pub(crate) fn from_database(db: database::Database) -> Self {
         Self {
-            map: Default::default(),
+            state: Default::default(),
             db,
         }
     }
 
+    #[cfg(test)]
+    async fn has_epoch(&self, id: &str) -> bool {
+        let epochs = self.state.read().await.epochs.clone();
+        let registry = epochs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.contains_key(id)
+    }
+
     #[inline]
     pub(crate) async fn get_for_rendezvous(&self, id: &str) -> Option<LockPeer> {
-        // 先捕获实例，再查数据库；数据库已 inactive 时只条件删除该实例。
-        let captured = self.map.read().await.get(id).cloned();
-        match self.db.get_peer_for_rendezvous(id).await {
-            Ok(Some(row)) => {
-                let mut map = self.map.write().await;
-                if let Some(current) = map.get(id) {
-                    return Some(current.clone());
+        self.get_for_rendezvous_with_hook(id, || std::future::ready(()))
+            .await
+    }
+
+    async fn get_for_rendezvous_with_hook<F, Fut>(
+        &self,
+        id: &str,
+        mut after_database_query: F,
+    ) -> Option<LockPeer>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        loop {
+            // Arc 指针只能发现 map 中已经发生的替换。epoch 还会记录“map 当时为空”
+            // 或“当前是别的 guid”时完成的失效，阻止迟到的数据库快照在 ACK 后回写。
+            let (captured, epoch_lease) = {
+                let state = self.state.write().await;
+                let captured = state.peers.get(id).cloned();
+                let epoch_lease = EpochLease::acquire(&state, id);
+                (captured, epoch_lease)
+            };
+            let captured_guid = match captured.as_ref() {
+                Some(peer) => Some(peer.read().await.guid.clone()),
+                None => None,
+            };
+            let database_result = self.db.get_peer_for_rendezvous(id).await;
+            after_database_query().await;
+            match database_result {
+                Ok(Some(row)) => {
+                    let database_guid = row.guid.clone();
+                    let mut state = self.state.write().await;
+                    if epoch_lease.has_advanced() {
+                        continue;
+                    }
+                    let result = match (captured.as_ref(), state.peers.get(id)) {
+                        (Some(captured), Some(current)) if Arc::ptr_eq(captured, current) => {
+                            if captured_guid.as_deref() == Some(database_guid.as_slice()) {
+                                Some(current.clone())
+                            } else {
+                                let peer = peer_from_database(row);
+                                state.peers.insert(id.to_owned(), peer.clone());
+                                Some(peer)
+                            }
+                        }
+                        (None, None) => {
+                            let peer = peer_from_database(row);
+                            state.peers.insert(id.to_owned(), peer.clone());
+                            Some(peer)
+                        }
+                        _ => None,
+                    };
+                    if let Some(peer) = result {
+                        return Some(peer);
+                    }
                 }
-                let peer = peer_from_database(row);
-                map.insert(id.to_owned(), peer.clone());
-                Some(peer)
-            }
-            Ok(None) => {
-                self.remove_captured(id, captured).await;
-                None
-            }
-            Err(err) => {
-                log::error!("查询设备 {} 的准入状态失败: {:#}", id, err);
-                None
+                Ok(None) => {
+                    self.remove_captured(id, captured).await;
+                    return None;
+                }
+                Err(err) => {
+                    log::error!("查询设备 {} 的准入状态失败: {:#}", id, err);
+                    return None;
+                }
             }
         }
+    }
+
+    fn advance_epoch_locked(state: &mut PeerMapState, id: &str) {
+        let mut registry = state
+            .epochs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remove_after_advance = {
+            let epoch = registry
+                .entry(id.to_owned())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+            epoch.fetch_add(1, Ordering::AcqRel);
+            Arc::strong_count(epoch) == 1
+        };
+        // 没有查询持有该 token 时可立即回收；之后的新查询尚未读取数据库，
+        // 即使新建 token 从 0 开始，也不可能携带本次失效之前的快照。
+        if remove_after_advance {
+            registry.remove(id);
+        }
+    }
+
+    async fn advance_epoch(&self, id: &str) {
+        let mut state = self.state.write().await;
+        Self::advance_epoch_locked(&mut state, id);
     }
 
     pub(crate) async fn insert_admitted(
@@ -219,23 +368,63 @@ impl PeerMap {
         row: database::Peer,
         socket_addr: SocketAddr,
         reg_pk: (u32, Instant),
-    ) -> LockPeer {
-        let peer = Arc::new(RwLock::new(Peer {
-            socket_addr,
-            last_reg_time: Instant::now(),
-            uuid: row.uuid.into(),
-            pk: row.pk.into(),
-            info: serde_json::from_str::<PeerInfo>(&row.info).unwrap_or_default(),
-            reg_pk,
-            admitted: true,
-        }));
-        self.map.write().await.insert(id, peer.clone());
-        peer
+    ) -> Option<LockPeer> {
+        self.insert_admitted_with_hook(id, row, socket_addr, reg_pk, || std::future::ready(()))
+            .await
+    }
+
+    async fn insert_admitted_with_hook<F, Fut>(
+        &self,
+        id: String,
+        admitted_row: database::Peer,
+        socket_addr: SocketAddr,
+        reg_pk: (u32, Instant),
+        mut after_database_query: F,
+    ) -> Option<LockPeer>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let expected_guid = admitted_row.guid;
+        loop {
+            let epoch_lease = {
+                let state = self.state.write().await;
+                EpochLease::acquire(&state, &id)
+            };
+            let database_result = self.db.get_peer_for_rendezvous(&id).await;
+            after_database_query().await;
+            let row = match database_result {
+                Ok(Some(row)) if row.guid == expected_guid => row,
+                Ok(_) => return None,
+                Err(err) => {
+                    log::error!("设备 {} 准入结果二次校验失败: {:#}", id, err);
+                    return None;
+                }
+            };
+
+            let mut state = self.state.write().await;
+            if epoch_lease.has_advanced() {
+                continue;
+            }
+            let peer = Arc::new(RwLock::new(Peer {
+                socket_addr,
+                last_reg_time: Instant::now(),
+                guid: row.guid,
+                uuid: row.uuid.into(),
+                pk: row.pk.into(),
+                info: serde_json::from_str::<PeerInfo>(&row.info).unwrap_or_default(),
+                reg_pk,
+                admitted: true,
+            }));
+            state.peers.insert(id.clone(), peer.clone());
+            Self::advance_epoch_locked(&mut state, &id);
+            return Some(peer);
+        }
     }
 
     #[inline]
     pub(crate) async fn get_in_memory(&self, id: &str) -> Option<LockPeer> {
-        let peer = self.map.read().await.get(id).cloned()?;
+        let peer = self.state.read().await.peers.get(id).cloned()?;
         if peer.read().await.admitted {
             Some(peer)
         } else {
@@ -252,18 +441,109 @@ impl PeerMap {
         &self,
         id: &str,
     ) -> ResultType<InvalidationResult> {
-        let captured = self.map.read().await.get(id).cloned();
-        if !self.db.is_device_inactive(id).await? {
-            return Ok(InvalidationResult::NoLongerInactive);
+        let captured = self.state.read().await.peers.get(id).cloned();
+        let captured_guid = match captured.as_ref() {
+            Some(peer) => Some(peer.read().await.guid.clone()),
+            None => None,
+        };
+        match self.db.get_peer(id).await? {
+            Some(row)
+                if row.status != database::DeviceStatus::Inactive.as_str()
+                    && captured_guid
+                        .as_deref()
+                        .is_none_or(|guid| guid == row.guid.as_slice()) =>
+            {
+                self.advance_epoch(id).await;
+                Ok(InvalidationResult::NoLongerInactive)
+            }
+            // missing、inactive 或活动行已是另一 guid 时，只条件删除捕获的旧 Arc。
+            // 若 map 已换成新 Arc，remove_captured 会返回 Replaced 并保留它。
+            _ => Ok(self.remove_captured(id, captured).await),
         }
-        Ok(self.remove_captured(id, captured).await)
+    }
+
+    pub(crate) async fn invalidate(
+        &self,
+        id: &str,
+        predicate: DeviceInvalidationPredicate,
+    ) -> ResultType<InvalidationResult> {
+        match predicate {
+            DeviceInvalidationPredicate::StillInactive => {
+                self.invalidate_if_still_inactive(id).await
+            }
+            DeviceInvalidationPredicate::DeletedGeneration { guid } => {
+                self.invalidate_deleted_generation(id, &guid).await
+            }
+        }
+    }
+
+    pub(crate) async fn invalidate_deleted_generation(
+        &self,
+        id: &str,
+        deleted_guid: &[u8],
+    ) -> ResultType<InvalidationResult> {
+        if self
+            .db
+            .get_peer(id)
+            .await?
+            .is_some_and(|row| row.guid == deleted_guid)
+        {
+            self.advance_epoch(id).await;
+            return Ok(InvalidationResult::GenerationStillPresent);
+        }
+        Ok(self.remove_generation(id, deleted_guid).await)
+    }
+
+    pub(crate) async fn invalidate_if_not_admitted(
+        &self,
+        id: &str,
+        expected_guid: &[u8],
+    ) -> ResultType<InvalidationResult> {
+        if self
+            .db
+            .get_peer_for_rendezvous(id)
+            .await?
+            .is_some_and(|row| row.guid == expected_guid)
+        {
+            self.advance_epoch(id).await;
+            return Ok(InvalidationResult::GenerationStillPresent);
+        }
+        Ok(self.remove_generation(id, expected_guid).await)
+    }
+
+    async fn remove_generation(&self, id: &str, expected_guid: &[u8]) -> InvalidationResult {
+        loop {
+            let current = self.state.read().await.peers.get(id).cloned();
+            let current_guid = match current.as_ref() {
+                Some(peer) => Some(peer.read().await.guid.clone()),
+                None => None,
+            };
+
+            // epoch 推进与最终 map 判定/删除在同一写锁内；Peer 锁读取则在锁外完成，
+            // 避免慢 Peer writer 阻塞所有设备的 state。
+            let mut state = self.state.write().await;
+            Self::advance_epoch_locked(&mut state, id);
+            match (current.as_ref(), state.peers.get(id)) {
+                (None, None) => return InvalidationResult::AlreadyAbsent,
+                (Some(current), Some(latest)) if Arc::ptr_eq(current, latest) => {
+                    if current_guid.as_deref() != Some(expected_guid) {
+                        return InvalidationResult::Replaced;
+                    }
+                    state.peers.remove(id);
+                    return InvalidationResult::Removed;
+                }
+                (Some(_), None) => return InvalidationResult::AlreadyAbsent,
+                _ => continue,
+            }
+        }
     }
 
     async fn remove_captured(&self, id: &str, captured: Option<LockPeer>) -> InvalidationResult {
-        let mut map = self.map.write().await;
-        match (captured, map.get(id)) {
+        let mut state = self.state.write().await;
+        Self::advance_epoch_locked(&mut state, id);
+        match (captured, state.peers.get(id)) {
             (Some(captured), Some(current)) if Arc::ptr_eq(&captured, current) => {
-                map.remove(id);
+                state.peers.remove(id);
                 InvalidationResult::Removed
             }
             (Some(_), Some(_)) | (None, Some(_)) => InvalidationResult::Replaced,
@@ -274,6 +554,7 @@ impl PeerMap {
 
 fn peer_from_database(row: database::Peer) -> LockPeer {
     Arc::new(RwLock::new(Peer {
+        guid: row.guid,
         uuid: row.uuid.into(),
         pk: row.pk.into(),
         info: serde_json::from_str::<PeerInfo>(&row.info).unwrap_or_default(),
@@ -320,7 +601,11 @@ fn selected_db_path(db_url: Option<String>, configured: Option<String>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use sqlx::{Connection, Executor, SqliteConnection};
+    use std::{
+        sync::atomic::AtomicBool,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn test_default_db_path_is_legacy_compatible() {
@@ -399,7 +684,7 @@ mod tests {
                 .unwrap();
             db.set_device_inactive("inactive-device").await.unwrap();
             let pm = PeerMap {
-                map: Default::default(),
+                state: Default::default(),
                 db,
             };
             assert!(pm.get_for_rendezvous("inactive-device").await.is_none());
@@ -415,7 +700,7 @@ mod tests {
             let path = temp_db_path("conditional-removal");
             let db = database::Database::new(&path).await.unwrap();
             let pm = PeerMap {
-                map: Default::default(),
+                state: Default::default(),
                 db,
             };
             let old = Arc::new(RwLock::new(Peer {
@@ -426,9 +711,10 @@ mod tests {
                 admitted: true,
                 ..Default::default()
             }));
-            pm.map
+            pm.state
                 .write()
                 .await
+                .peers
                 .insert("device-a".to_string(), replacement.clone());
             assert_eq!(
                 pm.remove_captured("device-a", Some(old)).await,
@@ -438,6 +724,599 @@ mod tests {
                 &pm.get_in_memory("device-a").await.unwrap(),
                 &replacement
             ));
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn deleted_generation_removes_matching_cached_peer() {
+        let rt = hbb_common::tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("deleted-generation");
+            let db = database::Database::new(&path).await.unwrap();
+            let guid = db
+                .insert_peer("deleted-device", b"uuid-old", b"pk-old", "{}")
+                .await
+                .unwrap();
+            let pm = PeerMap::from_database(db);
+            let cached = pm.get_for_rendezvous("deleted-device").await.unwrap();
+            assert_eq!(cached.read().await.guid, guid);
+
+            let mut conn = SqliteConnection::connect(&path).await.unwrap();
+            conn.execute("DELETE FROM devices WHERE device_id = 'deleted-device'")
+                .await
+                .unwrap();
+            drop(conn);
+
+            assert_eq!(
+                pm.invalidate(
+                    "deleted-device",
+                    DeviceInvalidationPredicate::DeletedGeneration { guid }
+                )
+                .await
+                .unwrap(),
+                InvalidationResult::Removed
+            );
+            assert!(pm.get_in_memory("deleted-device").await.is_none());
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn deleted_generation_preserves_generation_still_in_database() {
+        let rt = hbb_common::tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("generation-still-present");
+            let db = database::Database::new(&path).await.unwrap();
+            let guid = db
+                .insert_peer("present-device", b"uuid", b"pk", "{}")
+                .await
+                .unwrap();
+            let pm = PeerMap::from_database(db);
+            let cached = pm.get_for_rendezvous("present-device").await.unwrap();
+
+            assert_eq!(
+                pm.invalidate_deleted_generation("present-device", &guid)
+                    .await
+                    .unwrap(),
+                InvalidationResult::GenerationStillPresent
+            );
+            assert!(Arc::ptr_eq(
+                &cached,
+                &pm.get_in_memory("present-device").await.unwrap()
+            ));
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn deleted_generation_removes_old_arc_after_new_database_generation_commits() {
+        let rt = hbb_common::tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("deleted-generation-reregister");
+            let db = database::Database::new(&path).await.unwrap();
+            let old_guid = db
+                .insert_peer("reused-device", b"uuid-old", b"pk-old", "{}")
+                .await
+                .unwrap();
+            let pm = PeerMap::from_database(db.clone());
+            let old = pm.get_for_rendezvous("reused-device").await.unwrap();
+
+            let mut conn = SqliteConnection::connect(&path).await.unwrap();
+            conn.execute("DELETE FROM devices WHERE device_id = 'reused-device'")
+                .await
+                .unwrap();
+            drop(conn);
+            let new_guid = db
+                .insert_peer("reused-device", b"uuid-new", b"pk-new", "{}")
+                .await
+                .unwrap();
+
+            assert!(Arc::ptr_eq(
+                &old,
+                &pm.get_in_memory("reused-device").await.unwrap()
+            ));
+            assert_eq!(
+                pm.invalidate_deleted_generation("reused-device", &old_guid)
+                    .await
+                    .unwrap(),
+                InvalidationResult::Removed
+            );
+            let current = pm.get_for_rendezvous("reused-device").await.unwrap();
+            assert_eq!(current.read().await.guid, new_guid);
+            assert!(!Arc::ptr_eq(&old, &current));
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn rendezvous_lookup_replaces_stale_generation() {
+        let rt = hbb_common::tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("lookup-generation-reregister");
+            let db = database::Database::new(&path).await.unwrap();
+            db.insert_peer("lookup-device", b"uuid-old", b"pk-old", "{}")
+                .await
+                .unwrap();
+            let pm = PeerMap::from_database(db.clone());
+            let old = pm.get_for_rendezvous("lookup-device").await.unwrap();
+
+            let mut conn = SqliteConnection::connect(&path).await.unwrap();
+            conn.execute("DELETE FROM devices WHERE device_id = 'lookup-device'")
+                .await
+                .unwrap();
+            drop(conn);
+            let new_guid = db
+                .insert_peer("lookup-device", b"uuid-new", b"pk-new", "{}")
+                .await
+                .unwrap();
+
+            let current = pm.get_for_rendezvous("lookup-device").await.unwrap();
+            assert_eq!(current.read().await.guid, new_guid);
+            assert!(!Arc::ptr_eq(&old, &current));
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn still_inactive_preserves_reactivated_same_generation() {
+        let rt = hbb_common::tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("inactive-reactivated");
+            let db = database::Database::new(&path).await.unwrap();
+            db.insert_peer("reactivated-device", b"uuid", b"pk", "{}")
+                .await
+                .unwrap();
+            let pm = PeerMap::from_database(db.clone());
+            let cached = pm.get_for_rendezvous("reactivated-device").await.unwrap();
+            db.set_device_inactive("reactivated-device").await.unwrap();
+
+            let mut conn = SqliteConnection::connect(&path).await.unwrap();
+            conn.execute(
+                "UPDATE devices SET status = 'offline' WHERE device_id = 'reactivated-device'",
+            )
+            .await
+            .unwrap();
+            drop(conn);
+
+            assert_eq!(
+                pm.invalidate(
+                    "reactivated-device",
+                    DeviceInvalidationPredicate::StillInactive
+                )
+                .await
+                .unwrap(),
+                InvalidationResult::NoLongerInactive
+            );
+            assert!(Arc::ptr_eq(
+                &cached,
+                &pm.get_in_memory("reactivated-device").await.unwrap()
+            ));
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn still_inactive_removes_cached_generation() {
+        let rt = hbb_common::tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("still-inactive");
+            let db = database::Database::new(&path).await.unwrap();
+            db.insert_peer("still-inactive-device", b"uuid", b"pk", "{}")
+                .await
+                .unwrap();
+            let pm = PeerMap::from_database(db.clone());
+            pm.get_for_rendezvous("still-inactive-device")
+                .await
+                .unwrap();
+            db.set_device_inactive("still-inactive-device")
+                .await
+                .unwrap();
+
+            assert_eq!(
+                pm.invalidate(
+                    "still-inactive-device",
+                    DeviceInvalidationPredicate::StillInactive
+                )
+                .await
+                .unwrap(),
+                InvalidationResult::Removed
+            );
+            assert!(pm.get_in_memory("still-inactive-device").await.is_none());
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn still_inactive_removes_captured_peer_when_database_row_is_missing() {
+        let rt = hbb_common::tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("still-inactive-missing");
+            let db = database::Database::new(&path).await.unwrap();
+            db.insert_peer("missing-device", b"uuid", b"pk", "{}")
+                .await
+                .unwrap();
+            let pm = PeerMap::from_database(db);
+            pm.get_for_rendezvous("missing-device").await.unwrap();
+
+            let mut conn = SqliteConnection::connect(&path).await.unwrap();
+            conn.execute("DELETE FROM devices WHERE device_id = 'missing-device'")
+                .await
+                .unwrap();
+            drop(conn);
+
+            assert_eq!(
+                pm.invalidate_if_still_inactive("missing-device")
+                    .await
+                    .unwrap(),
+                InvalidationResult::Removed
+            );
+            assert!(pm.get_in_memory("missing-device").await.is_none());
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn still_inactive_drops_old_arc_when_database_has_a_new_active_guid() {
+        let rt = hbb_common::tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("still-inactive-new-guid");
+            let db = database::Database::new(&path).await.unwrap();
+            db.insert_peer("new-guid-device", b"uuid-old", b"pk-old", "{}")
+                .await
+                .unwrap();
+            let pm = PeerMap::from_database(db.clone());
+            let old = pm.get_for_rendezvous("new-guid-device").await.unwrap();
+
+            let mut conn = SqliteConnection::connect(&path).await.unwrap();
+            conn.execute("DELETE FROM devices WHERE device_id = 'new-guid-device'")
+                .await
+                .unwrap();
+            drop(conn);
+            let new_guid = db
+                .insert_peer("new-guid-device", b"uuid-new", b"pk-new", "{}")
+                .await
+                .unwrap();
+
+            assert_eq!(
+                pm.invalidate_if_still_inactive("new-guid-device")
+                    .await
+                    .unwrap(),
+                InvalidationResult::Removed
+            );
+            let current = pm.get_for_rendezvous("new-guid-device").await.unwrap();
+            assert_eq!(current.read().await.guid, new_guid);
+            assert!(!Arc::ptr_eq(&old, &current));
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn deleted_generation_epoch_rejects_a_late_database_snapshot_after_ack() {
+        let rt = hbb_common::tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("deleted-generation-late-lookup");
+            let db = database::Database::new(&path).await.unwrap();
+            let guid = db
+                .insert_peer("late-deleted-device", b"uuid-old", b"pk-old", "{}")
+                .await
+                .unwrap();
+            let pm = PeerMap::from_database(db);
+            let query_barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let resume_barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let first_query = Arc::new(AtomicBool::new(true));
+            let lookup_pm = pm.clone();
+            let lookup = tokio::spawn({
+                let query_barrier = query_barrier.clone();
+                let resume_barrier = resume_barrier.clone();
+                async move {
+                    lookup_pm
+                        .get_for_rendezvous_with_hook("late-deleted-device", move || {
+                            let query_barrier = query_barrier.clone();
+                            let resume_barrier = resume_barrier.clone();
+                            let should_pause = first_query.swap(false, Ordering::SeqCst);
+                            async move {
+                                if should_pause {
+                                    query_barrier.wait().await;
+                                    resume_barrier.wait().await;
+                                }
+                            }
+                        })
+                        .await
+                }
+            });
+
+            query_barrier.wait().await;
+            let mut conn = SqliteConnection::connect(&path).await.unwrap();
+            conn.execute("DELETE FROM devices WHERE device_id = 'late-deleted-device'")
+                .await
+                .unwrap();
+            drop(conn);
+            assert_eq!(
+                pm.invalidate_deleted_generation("late-deleted-device", &guid)
+                    .await
+                    .unwrap(),
+                InvalidationResult::AlreadyAbsent
+            );
+            resume_barrier.wait().await;
+
+            assert!(lookup.await.unwrap().is_none());
+            let state = pm.state.read().await;
+            assert!(!state.peers.contains_key("late-deleted-device"));
+            drop(state);
+            assert!(!pm.has_epoch("late-deleted-device").await);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn still_inactive_epoch_rejects_a_late_active_snapshot_after_ack() {
+        let rt = hbb_common::tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("still-inactive-late-lookup");
+            let db = database::Database::new(&path).await.unwrap();
+            db.insert_peer("late-inactive-device", b"uuid", b"pk", "{}")
+                .await
+                .unwrap();
+            let pm = PeerMap::from_database(db.clone());
+            let query_barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let resume_barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let first_query = Arc::new(AtomicBool::new(true));
+            let lookup_pm = pm.clone();
+            let lookup = tokio::spawn({
+                let query_barrier = query_barrier.clone();
+                let resume_barrier = resume_barrier.clone();
+                async move {
+                    lookup_pm
+                        .get_for_rendezvous_with_hook("late-inactive-device", move || {
+                            let query_barrier = query_barrier.clone();
+                            let resume_barrier = resume_barrier.clone();
+                            let should_pause = first_query.swap(false, Ordering::SeqCst);
+                            async move {
+                                if should_pause {
+                                    query_barrier.wait().await;
+                                    resume_barrier.wait().await;
+                                }
+                            }
+                        })
+                        .await
+                }
+            });
+
+            query_barrier.wait().await;
+            db.set_device_inactive("late-inactive-device")
+                .await
+                .unwrap();
+            assert_eq!(
+                pm.invalidate_if_still_inactive("late-inactive-device")
+                    .await
+                    .unwrap(),
+                InvalidationResult::AlreadyAbsent
+            );
+            resume_barrier.wait().await;
+
+            assert!(lookup.await.unwrap().is_none());
+            let state = pm.state.read().await;
+            assert!(!state.peers.contains_key("late-inactive-device"));
+            drop(state);
+            assert!(!pm.has_epoch("late-inactive-device").await);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn admitted_row_epoch_rejects_cache_insert_after_delete_ack() {
+        let rt = hbb_common::tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("admission-result-late-insert");
+            let db = database::Database::new(&path).await.unwrap();
+            let guid = db
+                .insert_peer("late-admission-device", b"uuid", b"pk", "{}")
+                .await
+                .unwrap();
+            let admitted_row = db
+                .get_peer_for_rendezvous("late-admission-device")
+                .await
+                .unwrap()
+                .unwrap();
+            let pm = PeerMap::from_database(db);
+            let query_barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let resume_barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let first_query = Arc::new(AtomicBool::new(true));
+            let inserting_pm = pm.clone();
+            let inserting = tokio::spawn({
+                let query_barrier = query_barrier.clone();
+                let resume_barrier = resume_barrier.clone();
+                async move {
+                    inserting_pm
+                        .insert_admitted_with_hook(
+                            "late-admission-device".to_owned(),
+                            admitted_row,
+                            "127.0.0.1:21116".parse().unwrap(),
+                            (1, Instant::now()),
+                            move || {
+                                let query_barrier = query_barrier.clone();
+                                let resume_barrier = resume_barrier.clone();
+                                let should_pause = first_query.swap(false, Ordering::SeqCst);
+                                async move {
+                                    if should_pause {
+                                        query_barrier.wait().await;
+                                        resume_barrier.wait().await;
+                                    }
+                                }
+                            },
+                        )
+                        .await
+                }
+            });
+
+            query_barrier.wait().await;
+            let mut conn = SqliteConnection::connect(&path).await.unwrap();
+            conn.execute("DELETE FROM devices WHERE device_id = 'late-admission-device'")
+                .await
+                .unwrap();
+            drop(conn);
+            assert_eq!(
+                pm.invalidate_deleted_generation("late-admission-device", &guid)
+                    .await
+                    .unwrap(),
+                InvalidationResult::AlreadyAbsent
+            );
+            resume_barrier.wait().await;
+
+            assert!(inserting.await.unwrap().is_none());
+            let state = pm.state.read().await;
+            assert!(!state.peers.contains_key("late-admission-device"));
+            drop(state);
+            assert!(!pm.has_epoch("late-admission-device").await);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn admitted_row_epoch_rejects_cache_insert_after_inactive_ack() {
+        let rt = hbb_common::tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("admission-result-inactive");
+            let db = database::Database::new(&path).await.unwrap();
+            db.insert_peer("inactive-admission-device", b"uuid", b"pk", "{}")
+                .await
+                .unwrap();
+            let admitted_row = db
+                .get_peer_for_rendezvous("inactive-admission-device")
+                .await
+                .unwrap()
+                .unwrap();
+            let pm = PeerMap::from_database(db.clone());
+            let query_barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let resume_barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let first_query = Arc::new(AtomicBool::new(true));
+            let inserting_pm = pm.clone();
+            let inserting = tokio::spawn({
+                let query_barrier = query_barrier.clone();
+                let resume_barrier = resume_barrier.clone();
+                async move {
+                    inserting_pm
+                        .insert_admitted_with_hook(
+                            "inactive-admission-device".to_owned(),
+                            admitted_row,
+                            "127.0.0.1:21116".parse().unwrap(),
+                            (1, Instant::now()),
+                            move || {
+                                let query_barrier = query_barrier.clone();
+                                let resume_barrier = resume_barrier.clone();
+                                let should_pause = first_query.swap(false, Ordering::SeqCst);
+                                async move {
+                                    if should_pause {
+                                        query_barrier.wait().await;
+                                        resume_barrier.wait().await;
+                                    }
+                                }
+                            },
+                        )
+                        .await
+                }
+            });
+
+            query_barrier.wait().await;
+            db.set_device_inactive("inactive-admission-device")
+                .await
+                .unwrap();
+            assert_eq!(
+                pm.invalidate_if_still_inactive("inactive-admission-device")
+                    .await
+                    .unwrap(),
+                InvalidationResult::AlreadyAbsent
+            );
+            resume_barrier.wait().await;
+
+            assert!(inserting.await.unwrap().is_none());
+            let state = pm.state.read().await;
+            assert!(!state.peers.contains_key("inactive-admission-device"));
+            drop(state);
+            assert!(!pm.has_epoch("inactive-admission-device").await);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn cancelled_rendezvous_lookup_releases_epoch_lease() {
+        let rt = hbb_common::tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("cancelled-rendezvous-lookup");
+            let db = database::Database::new(&path).await.unwrap();
+            db.insert_peer("cancelled-lookup-device", b"uuid", b"pk", "{}")
+                .await
+                .unwrap();
+            let pm = PeerMap::from_database(db);
+            let query_barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let lookup_pm = pm.clone();
+            let lookup = tokio::spawn({
+                let query_barrier = query_barrier.clone();
+                async move {
+                    lookup_pm
+                        .get_for_rendezvous_with_hook("cancelled-lookup-device", move || {
+                            let query_barrier = query_barrier.clone();
+                            async move {
+                                query_barrier.wait().await;
+                                std::future::pending::<()>().await;
+                            }
+                        })
+                        .await
+                }
+            });
+
+            query_barrier.wait().await;
+            lookup.abort();
+            assert!(matches!(lookup.await, Err(err) if err.is_cancelled()));
+            assert!(!pm.has_epoch("cancelled-lookup-device").await);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn cancelled_admitted_insert_releases_epoch_lease() {
+        let rt = hbb_common::tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("cancelled-admitted-insert");
+            let db = database::Database::new(&path).await.unwrap();
+            db.insert_peer("cancelled-insert-device", b"uuid", b"pk", "{}")
+                .await
+                .unwrap();
+            let admitted_row = db
+                .get_peer_for_rendezvous("cancelled-insert-device")
+                .await
+                .unwrap()
+                .unwrap();
+            let pm = PeerMap::from_database(db);
+            let query_barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let inserting_pm = pm.clone();
+            let inserting = tokio::spawn({
+                let query_barrier = query_barrier.clone();
+                async move {
+                    inserting_pm
+                        .insert_admitted_with_hook(
+                            "cancelled-insert-device".to_owned(),
+                            admitted_row,
+                            "127.0.0.1:21116".parse().unwrap(),
+                            (1, Instant::now()),
+                            move || {
+                                let query_barrier = query_barrier.clone();
+                                async move {
+                                    query_barrier.wait().await;
+                                    std::future::pending::<()>().await;
+                                }
+                            },
+                        )
+                        .await
+                }
+            });
+
+            query_barrier.wait().await;
+            inserting.abort();
+            assert!(matches!(inserting.await, Err(err) if err.is_cancelled()));
+            assert!(!pm.has_epoch("cancelled-insert-device").await);
+            assert!(!pm.is_in_memory("cancelled-insert-device").await);
             cleanup(&path);
         });
     }

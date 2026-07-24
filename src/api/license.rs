@@ -1,14 +1,17 @@
 use crate::{
     auth::jwt::CurrentUser,
     database::{Database, InactiveUpdate},
-    peer::{DeviceInvalidationCommand, DeviceInvalidationSender, InvalidationResult},
+    peer::{
+        DeviceInvalidationCommand, DeviceInvalidationPredicate, DeviceInvalidationSender,
+        InvalidationResult,
+    },
 };
 use axum::{extract::Extension, extract::Path, http::StatusCode, Json};
 use once_cell::sync::Lazy;
 use serde_derive::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
-    sync::{oneshot, Mutex},
+    sync::{mpsc::error::TrySendError, oneshot, Mutex},
     time::{timeout, Duration},
 };
 
@@ -205,16 +208,11 @@ pub async fn handle_device_inactive(
     }
 
     // 即使数据库原本已 inactive，也必须重发失效命令，以便幂等重试修复缓存。
-    let (ack_tx, ack_rx) = oneshot::channel();
-    if device_control_tx
-        .send(DeviceInvalidationCommand {
-            device_id: device_id.clone(),
-            ack: ack_tx,
-        })
-        .is_err()
-    {
-        return Err(invalidation_unavailable());
-    }
+    let ack_rx = enqueue_invalidation(
+        &device_control_tx,
+        device_id.clone(),
+        DeviceInvalidationPredicate::StillInactive,
+    )?;
 
     let invalidation = match timeout(Duration::from_secs(2), ack_rx).await {
         Ok(Ok(Ok(result))) => result,
@@ -278,11 +276,77 @@ fn invalidation_unavailable() -> ApiError {
     )
 }
 
+fn enqueue_invalidation(
+    sender: &DeviceInvalidationSender,
+    device_id: String,
+    predicate: DeviceInvalidationPredicate,
+) -> Result<oneshot::Receiver<Result<InvalidationResult, ()>>, ApiError> {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    match sender.try_send(DeviceInvalidationCommand {
+        device_id,
+        predicate,
+        ack: ack_tx,
+    }) {
+        Ok(()) => Ok(ack_rx),
+        Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
+            Err(invalidation_unavailable())
+        }
+    }
+}
+
 fn invalidation_name(result: InvalidationResult) -> &'static str {
     match result {
         InvalidationResult::Removed => "removed",
         InvalidationResult::AlreadyAbsent => "already_absent",
         InvalidationResult::Replaced => "replaced",
         InvalidationResult::NoLongerInactive => "no_longer_inactive",
+        InvalidationResult::GenerationStillPresent => "generation_still_present",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_invalidation_channel_keeps_issue_7_retryable() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let first = enqueue_invalidation(
+            &tx,
+            "device-first".to_string(),
+            DeviceInvalidationPredicate::StillInactive,
+        );
+        assert!(first.is_ok());
+
+        let second = enqueue_invalidation(
+            &tx,
+            "device-second".to_string(),
+            DeviceInvalidationPredicate::StillInactive,
+        );
+        assert_retryable_invalidation_error(second);
+    }
+
+    #[test]
+    fn closed_invalidation_channel_keeps_issue_7_retryable() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+
+        let result = enqueue_invalidation(
+            &tx,
+            "device-closed".to_string(),
+            DeviceInvalidationPredicate::StillInactive,
+        );
+        assert_retryable_invalidation_error(result);
+    }
+
+    fn assert_retryable_invalidation_error(
+        result: Result<oneshot::Receiver<Result<InvalidationResult, ()>>, ApiError>,
+    ) {
+        let Err((status, Json(body))) = result else {
+            panic!("expected retryable invalidation error");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["database_inactive_committed"], true);
+        assert_eq!(body["retryable"], true);
     }
 }
