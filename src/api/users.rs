@@ -1,8 +1,15 @@
 use crate::{
-    api::{admin_init::hash_password, middleware::invalidate_token_cache},
+    api::{
+        access::ApiError,
+        auth_service::hash_plain_password,
+        middleware::{invalidate_token_cache, ApiProtectionState},
+    },
     auth::jwt::CurrentUser,
     database::{Database, UpdateUserFields},
-    models::user::{CreateUserRequest, UpdateUserRequest, UserSummary},
+    models::user::{
+        validate_safe_user_id, validate_username, CreateUserRequest, UpdateUserRequest,
+        UserSummary, MAX_SAFE_INTEGER,
+    },
 };
 use axum::{
     extract::{Extension, Path, Query},
@@ -10,11 +17,9 @@ use axum::{
     Json,
 };
 use serde_derive::{Deserialize, Serialize};
-use serde_json::{json, Value};
-
-type ApiError = (StatusCode, Json<Value>);
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Pagination {
     page: Option<i64>,
     page_size: Option<i64>,
@@ -38,7 +43,14 @@ pub async fn handle_list_users(
                 pagination.page_size.unwrap_or(20),
             )
             .await
-            .map_err(|_| internal_error("list users failed"))?;
+            .map_err(|_| ApiError::internal("list users failed"))?;
+        if !(0..=MAX_SAFE_INTEGER).contains(&total)
+            || users
+                .iter()
+                .any(|user| validate_safe_user_id(user.id).is_err())
+        {
+            return Err(ApiError::internal("invalid user list response"));
+        }
         return Ok(Json(UserListResponse {
             items: users.into_iter().map(UserSummary::from).collect(),
             total,
@@ -48,8 +60,9 @@ pub async fn handle_list_users(
     let user = db
         .find_user_by_id(current.id)
         .await
-        .map_err(|_| internal_error("user lookup failed"))?
+        .map_err(|_| ApiError::internal("user lookup failed"))?
         .ok_or_else(not_found)?;
+    validate_safe_user_id(user.id).map_err(|_| ApiError::internal("invalid user id"))?;
     Ok(Json(UserListResponse {
         items: vec![UserSummary::from(user)],
         total: 1,
@@ -59,25 +72,26 @@ pub async fn handle_list_users(
 pub async fn handle_create_user(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
+    Extension(protection): Extension<ApiProtectionState>,
     Json(payload): Json<CreateUserRequest>,
 ) -> Result<(StatusCode, Json<UserSummary>), ApiError> {
     require_admin(&current)?;
     validate_role(&payload.role)?;
+    validate_username(&payload.username).map_err(ApiError::bad_request)?;
 
     if db
         .find_user_by_username(&payload.username)
         .await
-        .map_err(|_| internal_error("user lookup failed"))?
+        .map_err(|_| ApiError::internal("user lookup failed"))?
         .is_some()
     {
-        return Err((
+        return Err(ApiError::new(
             StatusCode::CONFLICT,
-            Json(json!({ "error": "username already exists" })),
+            "username already exists",
         ));
     }
 
-    let password_hash =
-        hash_password(&payload.password).map_err(|_| internal_error("password hash failed"))?;
+    let password_hash = hash_plain_password(&protection, &payload.password).await?;
     let user = db
         .create_user(
             &payload.username,
@@ -86,7 +100,8 @@ pub async fn handle_create_user(
             &payload.role,
         )
         .await
-        .map_err(|_| internal_error("create user failed"))?;
+        .map_err(|_| ApiError::internal("create user failed"))?;
+    validate_safe_user_id(user.id).map_err(|_| ApiError::internal("invalid user id"))?;
 
     Ok((StatusCode::CREATED, Json(UserSummary::from(user))))
 }
@@ -100,22 +115,23 @@ pub async fn handle_get_user(
     let user = db
         .find_user_by_id(id)
         .await
-        .map_err(|_| internal_error("user lookup failed"))?
+        .map_err(|_| ApiError::internal("user lookup failed"))?
         .ok_or_else(not_found)?;
+    validate_safe_user_id(user.id).map_err(|_| ApiError::internal("invalid user id"))?;
     Ok(Json(UserSummary::from(user)))
 }
 
 pub async fn handle_update_user(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
+    Extension(protection): Extension<ApiProtectionState>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateUserRequest>,
 ) -> Result<Json<UserSummary>, ApiError> {
     require_self_or_admin(&current, id)?;
     if current.role != "admin" && (payload.role.is_some() || payload.is_active.is_some()) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "only admin can update role or active state" })),
+        return Err(ApiError::forbidden(
+            "only admin can update role or active state",
         ));
     }
     if let Some(role) = payload.role.as_ref() {
@@ -123,9 +139,7 @@ pub async fn handle_update_user(
     }
 
     let password_hash = match payload.password.as_ref() {
-        Some(password) => {
-            Some(hash_password(password).map_err(|_| internal_error("password hash failed"))?)
-        }
+        Some(password) => Some(hash_plain_password(&protection, password).await?),
         None => None,
     };
     let should_increment_token_version = password_hash.is_some()
@@ -152,7 +166,8 @@ pub async fn handle_update_user(
             },
         )
         .await
-        .map_err(|_| internal_error("update user failed"))?;
+        .map_err(|_| ApiError::internal("update user failed"))?;
+    validate_safe_user_id(user.id).map_err(|_| ApiError::internal("invalid user id"))?;
 
     if should_increment_token_version {
         invalidate_token_cache(id);
@@ -168,35 +183,26 @@ pub async fn handle_delete_user(
 ) -> Result<StatusCode, ApiError> {
     require_admin(&current)?;
     if current.id == id {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "admin cannot delete self" })),
-        ));
+        return Err(ApiError::bad_request("admin cannot delete self"));
     }
 
     db.deactivate_user(id)
         .await
-        .map_err(|_| internal_error("delete user failed"))?;
+        .map_err(|_| ApiError::internal("delete user failed"))?;
     invalidate_token_cache(id);
     Ok(StatusCode::NO_CONTENT)
 }
 
 fn require_admin(current: &CurrentUser) -> Result<(), ApiError> {
     if current.role != "admin" {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "admin role required" })),
-        ));
+        return Err(ApiError::forbidden("admin role required"));
     }
     Ok(())
 }
 
 fn require_self_or_admin(current: &CurrentUser, target_id: i64) -> Result<(), ApiError> {
     if current.role != "admin" && current.id != target_id {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "you can only access your own resource" })),
-        ));
+        return Err(ApiError::forbidden("you can only access your own resource"));
     }
     Ok(())
 }
@@ -204,23 +210,10 @@ fn require_self_or_admin(current: &CurrentUser, target_id: i64) -> Result<(), Ap
 fn validate_role(role: &str) -> Result<(), ApiError> {
     match role {
         "admin" | "user" | "viewer" => Ok(()),
-        _ => Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid role" })),
-        )),
+        _ => Err(ApiError::bad_request("invalid role")),
     }
 }
 
 fn not_found() -> ApiError {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({ "error": "user not found" })),
-    )
-}
-
-fn internal_error(message: &str) -> ApiError {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": message })),
-    )
+    ApiError::not_found("user")
 }

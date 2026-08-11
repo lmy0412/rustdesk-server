@@ -7,7 +7,7 @@ use crate::{
     },
     config::OidcConfig,
     database::Database,
-    models::user::User,
+    models::user::{validate_username, User},
 };
 use axum::{
     extract::{Extension, Query},
@@ -32,7 +32,7 @@ pub struct OidcLoginResponse {
     pub authorization_url: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct OidcCallbackQuery {
     code: Option<String>,
     state: Option<String>,
@@ -90,8 +90,9 @@ pub async fn handle_oidc_callback(
     if !oidc_config.is_configured() {
         return redirect_error_or_json(&oidc_config, "oidc_not_configured");
     }
-    if let Some(err) = query.error.as_deref() {
-        log::warn!("OIDC provider returned error: {}", err);
+    if query.error.is_some() {
+        // Provider error/code/state 均来自回调查询，不得原样进入日志。
+        log::warn!("OIDC provider returned an error");
         return redirect_error(&oidc_config, "invalid_request");
     }
 
@@ -107,8 +108,8 @@ pub async fn handle_oidc_callback(
 
     let client = match build_oidc_client(&oidc_config).await {
         Ok(client) => client,
-        Err(err) => {
-            log::error!("OIDC discovery during callback failed: {}", err);
+        Err(_) => {
+            log::error!("OIDC discovery during callback failed");
             return redirect_error(&oidc_config, "token_exchange_failed");
         }
     };
@@ -120,8 +121,8 @@ pub async fn handle_oidc_callback(
         .await
     {
         Ok(response) => response,
-        Err(err) => {
-            log::error!("OIDC token exchange failed: {}", err);
+        Err(_) => {
+            log::error!("OIDC token exchange failed");
             return redirect_error(&oidc_config, "token_exchange_failed");
         }
     };
@@ -133,8 +134,8 @@ pub async fn handle_oidc_callback(
     let nonce = Nonce::new(session.nonce);
     let claims = match id_token.claims(&client.id_token_verifier(), &nonce) {
         Ok(claims) => claims,
-        Err(err) => {
-            log::error!("OIDC id_token validation failed: {}", err);
+        Err(_) => {
+            log::error!("OIDC id_token validation failed");
             return redirect_error(&oidc_config, "id_token_invalid");
         }
     };
@@ -312,6 +313,7 @@ async fn unique_oidc_username(
             .map_err(|_| OidcUserError::Database)?
             .is_some();
         if !exists {
+            validate_username(&candidate).map_err(|_| OidcUserError::Database)?;
             return Ok(candidate);
         }
     }
