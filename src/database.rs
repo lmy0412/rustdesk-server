@@ -1,4 +1,4 @@
-use crate::models::user::User;
+use crate::models::user::{validate_username, User};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use hbb_common::{bail, log, ResultType};
@@ -6,20 +6,122 @@ use sqlx::{
     sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, Row, Sqlite,
     SqliteConnection, Transaction,
 };
-use std::{ops::DerefMut, str::FromStr, time::Duration};
+use std::{
+    ops::DerefMut,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 //use sqlx::postgres::PgPoolOptions;
 //use sqlx::mysql::MySqlPoolOptions;
 
+pub mod addressbook;
 mod inventory;
 
+pub use addressbook::*;
 pub use inventory::*;
 
 type Pool = deadpool::managed::Pool<DbPool>;
+static NEXT_DATABASE_SCOPE: AtomicU64 = AtomicU64::new(1);
 const USER_COLUMNS: &str = "id, username, password_hash, email, role, is_active, token_version, oauth_provider, oauth_subject, last_login_at, created_at, updated_at";
 const DEVICE_COLUMNS: &str = "guid, device_id AS id, uuid, pk, CAST(NULL AS BLOB) AS user, info, status, last_seen, note, owner_user_id, group_id, features, token_version, management_generation";
 
 pub struct DbPool {
     url: String,
+}
+
+struct DatabaseMigrationLock {
+    file: std::fs::File,
+}
+
+impl DatabaseMigrationLock {
+    async fn acquire(path: PathBuf) -> ResultType<Self> {
+        tokio::task::spawn_blocking(move || Self::acquire_blocking(&path))
+            .await
+            .map_err(|_| hbb_common::anyhow::anyhow!("database migration lock worker failed"))?
+    }
+
+    fn acquire_blocking(path: &Path) -> ResultType<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            let result =
+                unsafe { hbb_common::libc::flock(file.as_raw_fd(), hbb_common::libc::LOCK_EX) };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            use std::{ffi::c_void, os::windows::io::AsRawHandle, thread};
+
+            #[link(name = "Kernel32")]
+            extern "system" {
+                fn LockFile(
+                    file: *mut c_void,
+                    offset_low: u32,
+                    offset_high: u32,
+                    bytes_low: u32,
+                    bytes_high: u32,
+                ) -> i32;
+            }
+
+            loop {
+                let locked =
+                    unsafe { LockFile(file.as_raw_handle(), 0, 0, u32::MAX, u32::MAX) } != 0;
+                if locked {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(33) {
+                    return Err(error.into());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        Ok(Self { file })
+    }
+}
+
+impl Drop for DatabaseMigrationLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let _ = unsafe {
+                hbb_common::libc::flock(self.file.as_raw_fd(), hbb_common::libc::LOCK_UN)
+            };
+        }
+
+        #[cfg(windows)]
+        {
+            use std::{ffi::c_void, os::windows::io::AsRawHandle};
+
+            #[link(name = "Kernel32")]
+            extern "system" {
+                fn UnlockFile(
+                    file: *mut c_void,
+                    offset_low: u32,
+                    offset_high: u32,
+                    bytes_low: u32,
+                    bytes_high: u32,
+                ) -> i32;
+            }
+
+            let _ = unsafe { UnlockFile(self.file.as_raw_handle(), 0, 0, u32::MAX, u32::MAX) };
+        }
+    }
 }
 
 #[async_trait]
@@ -44,6 +146,7 @@ impl deadpool::managed::Manager for DbPool {
 #[derive(Clone)]
 pub struct Database {
     pool: Pool,
+    auth_cache_scope: u64,
 }
 
 #[derive(Debug, Clone, Default, sqlx::FromRow)]
@@ -150,6 +253,8 @@ impl Database {
                 std::fs::create_dir_all(parent).ok();
             }
         }
+        let migration_lock =
+            DatabaseMigrationLock::acquire(PathBuf::from(format!("{url}.migration.lock"))).await?;
         if !std::path::Path::new(url).exists() {
             std::fs::File::create(url).ok();
         }
@@ -165,15 +270,54 @@ impl Database {
             n,
         );
         let mut conn = pool.get().await?;
+        log::warn!("数据库 schema 升级要求停止全部旧版服务端写进程；不支持新旧二进制滚动混跑");
         log::info!("Running database migrations...");
         sqlx::migrate!().run(conn.deref_mut()).await?;
-        ensure_users_token_version_column(conn.deref_mut()).await?;
-        migrate_legacy_peer_if_exists(conn.deref_mut()).await?;
-        verify_inventory_integrity(conn.deref_mut()).await?;
+        let mut tx = conn.begin().await?;
+        inventory::lock_inventory(&mut tx)
+            .await
+            .map_err(|error| hbb_common::anyhow::anyhow!(error.to_string()))?;
+        ensure_users_token_version_column(&mut tx).await?;
+        migrate_legacy_peer_if_exists(&mut tx).await?;
+        verify_inventory_integrity(&mut tx).await?;
+        addressbook::initialize_address_book(&mut tx).await?;
+        tx.commit().await?;
         log::info!("Database migrations complete");
         drop(conn);
-        let db = Database { pool };
+        drop(migration_lock);
+        let auth_cache_scope = NEXT_DATABASE_SCOPE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| {
+                hbb_common::anyhow::anyhow!("database authentication cache scope exhausted")
+            })?;
+        let db = Database {
+            pool,
+            auth_cache_scope,
+        };
         Ok(db)
+    }
+
+    pub fn auth_cache_scope(&self) -> u64 {
+        self.auth_cache_scope
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_inventory_write_lock_for_test(
+        &self,
+        acquired: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> ResultType<()> {
+        let mut connection = self.pool.get().await?;
+        let mut tx = connection.begin().await?;
+        inventory::lock_inventory(&mut tx)
+            .await
+            .map_err(|error| hbb_common::anyhow::anyhow!(error.to_string()))?;
+        let _ = acquired.send(());
+        let _ = release.await;
+        tx.rollback().await?;
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -225,13 +369,32 @@ impl Database {
         pk: &[u8],
         info: &str,
     ) -> ResultType<()> {
+        let mut connection = self.pool.get().await?;
+        let mut tx = connection.begin().await?;
+        inventory::lock_inventory(&mut tx)
+            .await
+            .map_err(|error| hbb_common::anyhow::anyhow!(error.to_string()))?;
+        let current = sqlx::query("SELECT id, device_id FROM devices WHERE guid = ?")
+            .bind(guid)
+            .fetch_optional(&mut tx)
+            .await?;
         sqlx::query("UPDATE devices SET device_id=?, pk=?, info=? WHERE guid=?")
             .bind(id)
             .bind(pk)
             .bind(info)
             .bind(guid)
-            .execute(self.pool.get().await?.deref_mut())
+            .execute(&mut tx)
             .await?;
+        if let Some(current) = current {
+            let row_id = current.try_get::<i64, _>("id")?;
+            let old_device_id = current.try_get::<String, _>("device_id")?;
+            if old_device_id != id {
+                addressbook::rename_device_memberships_in_tx(&mut tx, row_id, &old_device_id)
+                    .await
+                    .map_err(|error| hbb_common::anyhow::anyhow!(error.to_string()))?;
+            }
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -514,6 +677,9 @@ impl Database {
         email: Option<&str>,
         role: &str,
     ) -> ResultType<User> {
+        if let Err(message) = validate_username(username) {
+            bail!("{message}");
+        }
         Ok(sqlx::query_as::<_, User>(
             "
             INSERT INTO users(username, password_hash, email, role)
@@ -527,6 +693,20 @@ impl Database {
         .bind(role)
         .fetch_one(self.pool.get().await?.deref_mut())
         .await?)
+    }
+
+    pub async fn create_initial_admin_if_empty(&self, password_hash: &str) -> ResultType<bool> {
+        let result = sqlx::query(
+            "
+            INSERT INTO users(username, password_hash, email, role)
+            SELECT 'admin', ?, NULL, 'admin'
+            WHERE NOT EXISTS (SELECT 1 FROM users)
+            ",
+        )
+        .bind(password_hash)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn find_user_by_id(&self, id: i64) -> ResultType<Option<User>> {
@@ -777,17 +957,6 @@ impl Database {
         Ok(())
     }
 
-    pub async fn delete_user(&self, id: i64) -> ResultType<()> {
-        let affected = sqlx::query("DELETE FROM users WHERE id = ?")
-            .bind(id)
-            .execute(self.pool.get().await?.deref_mut())
-            .await?;
-        if affected.rows_affected() == 0 {
-            bail!("user not found");
-        }
-        Ok(())
-    }
-
     pub async fn count_users(&self) -> ResultType<i64> {
         let row = sqlx::query("SELECT COUNT(*) AS count FROM users")
             .fetch_one(self.pool.get().await?.deref_mut())
@@ -903,9 +1072,9 @@ async fn count_current_devices_in_tx(tx: &mut Transaction<'_, Sqlite>) -> Result
     Ok(row.try_get::<i64, _>("count")?.max(0) as u32)
 }
 
-async fn migrate_legacy_peer_if_exists(conn: &mut SqliteConnection) -> ResultType<()> {
+async fn migrate_legacy_peer_if_exists(tx: &mut Transaction<'_, Sqlite>) -> ResultType<()> {
     let peer_exists = fetch_count(
-        conn,
+        tx,
         "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name='peer'",
     )
     .await?
@@ -914,7 +1083,7 @@ async fn migrate_legacy_peer_if_exists(conn: &mut SqliteConnection) -> ResultTyp
         return Ok(());
     }
 
-    let devices_count = fetch_count(conn, "SELECT COUNT(*) AS count FROM devices").await?;
+    let devices_count = fetch_count(tx, "SELECT COUNT(*) AS count FROM devices").await?;
     if devices_count > 0 {
         log::info!(
             "Legacy peer migration skipped: devices already contains {} rows",
@@ -923,7 +1092,6 @@ async fn migrate_legacy_peer_if_exists(conn: &mut SqliteConnection) -> ResultTyp
         return Ok(());
     }
 
-    let mut tx = conn.begin().await?;
     let affected = sqlx::query(
         "
         INSERT INTO devices (guid, uuid, pk, device_id, note, info, created_at)
@@ -943,7 +1111,6 @@ async fn migrate_legacy_peer_if_exists(conn: &mut SqliteConnection) -> ResultTyp
     sqlx::query("ALTER TABLE peer RENAME TO peer_backup_legacy")
         .execute(&mut *tx)
         .await?;
-    tx.commit().await?;
     log::info!(
         "Migrated {} rows from peer to devices; old table renamed to peer_backup_legacy",
         affected.rows_affected()
@@ -951,26 +1118,26 @@ async fn migrate_legacy_peer_if_exists(conn: &mut SqliteConnection) -> ResultTyp
     Ok(())
 }
 
-async fn ensure_users_token_version_column(conn: &mut SqliteConnection) -> ResultType<()> {
+async fn ensure_users_token_version_column(tx: &mut Transaction<'_, Sqlite>) -> ResultType<()> {
     let rows = sqlx::query("PRAGMA table_info(users)")
-        .fetch_all(&mut *conn)
+        .fetch_all(&mut *tx)
         .await?;
     let has_token_version = rows
         .iter()
         .any(|row| row.try_get::<String, _>("name").ok().as_deref() == Some("token_version"));
     if !has_token_version {
         sqlx::query("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0")
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await?;
     }
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_users_token_version ON users (token_version)")
-        .execute(&mut *conn)
+        .execute(&mut *tx)
         .await?;
     Ok(())
 }
 
-async fn fetch_count(conn: &mut SqliteConnection, sql: &str) -> ResultType<i64> {
-    let row = sqlx::query(sql).fetch_one(&mut *conn).await?;
+async fn fetch_count(tx: &mut Transaction<'_, Sqlite>, sql: &str) -> ResultType<i64> {
+    let row = sqlx::query(sql).fetch_one(&mut *tx).await?;
     Ok(row.try_get::<i64, _>("count")?)
 }
 
@@ -978,12 +1145,36 @@ async fn fetch_count(conn: &mut SqliteConnection, sql: &str) -> ResultType<i64> 
 mod tests {
     use super::*;
     use hbb_common::tokio;
-    use sqlx::{Connection, Executor, SqliteConnection};
+    use sqlx::{migrate::Migrate, Connection, Executor, SqliteConnection};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const TEST_GUID: &[u8] = b"guid-binary-0001";
     const TEST_UUID: &[u8] = b"uuid-binary-0001";
     const TEST_PK: &[u8] = b"pk-binary-0001";
+
+    #[test]
+    fn create_user_enforces_username_boundary() {
+        run(async {
+            let path = temp_db_path("create-user-username");
+            let db = Database::new(&path).await.unwrap();
+
+            assert!(db.create_user("", "hash", None, "user").await.is_err());
+            assert!(db
+                .create_user(&"用".repeat(100), "hash", None, "user")
+                .await
+                .is_ok());
+            assert!(db
+                .create_user(&"a".repeat(101), "hash", None, "user")
+                .await
+                .is_err());
+            assert!(db
+                .create_user("bad\nname", "hash", None, "user")
+                .await
+                .is_err());
+
+            cleanup(&path);
+        });
+    }
 
     #[test]
     fn test_new_database_schema() {
@@ -1020,8 +1211,271 @@ mod tests {
                 .await
                 .unwrap());
             assert!(table_exists(&db, "device_quota_lock").await.unwrap());
+            for table in [
+                "device_shares",
+                "address_book_changes",
+                "address_book_backfill_state",
+            ] {
+                assert!(table_exists(&db, table).await.unwrap(), "{table}");
+            }
+            for index in [
+                "idx_devices_address_book_identity",
+                "idx_device_shares_recipient_status_id",
+                "idx_device_shares_owner_device_status",
+                "idx_device_shares_device_recipient",
+                "idx_ab_changes_user_lifecycle_version",
+            ] {
+                assert!(index_exists(&db, index).await.unwrap(), "{index}");
+            }
+            for trigger in [
+                "device_share_owner_insert",
+                "device_share_owner_update",
+                "address_book_change_insert_valid",
+                "address_book_change_immutable_update",
+                "address_book_change_immutable_delete",
+                "users_wire_range_insert",
+                "users_wire_range_update",
+            ] {
+                assert!(trigger_exists(&db, trigger).await.unwrap(), "{trigger}");
+            }
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                    .fetch_one(db.pool.get().await.unwrap().deref_mut())
+                    .await
+                    .unwrap(),
+                1
+            );
+            let address_book_schema = sqlx::query_scalar::<_, String>(
+                "SELECT group_concat(sql, char(10))
+                 FROM sqlite_master
+                 WHERE name IN (
+                     'device_shares',
+                     'address_book_changes',
+                     'address_book_backfill_state',
+                     'device_share_owner_insert',
+                     'device_share_owner_update',
+                     'address_book_change_insert_valid'
+                 )",
+            )
+            .fetch_one(db.pool.get().await.unwrap().deref_mut())
+            .await
+            .unwrap()
+            .to_ascii_lowercase();
+            assert!(
+                !address_book_schema.contains("json_")
+                    && !address_book_schema.contains("json_extract")
+                    && !address_book_schema.contains("json_valid"),
+                "地址簿 schema 不得依赖 SQLite JSON1"
+            );
 
             cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn concurrent_new_instances_serialize_the_entire_migration_window() {
+        run(async {
+            let path = temp_db_path("concurrent-migration");
+            std::fs::File::create(&path).unwrap();
+            let (first, second) = tokio::join!(Database::new(&path), Database::new(&path));
+            let first = first.unwrap();
+            let second = second.unwrap();
+
+            let migration_count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE success = 1",
+            )
+            .fetch_one(first.pool.get().await.unwrap().deref_mut())
+            .await
+            .unwrap();
+            let distinct_migration_count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(DISTINCT version) FROM _sqlx_migrations WHERE success = 1",
+            )
+            .fetch_one(second.pool.get().await.unwrap().deref_mut())
+            .await
+            .unwrap();
+            assert_eq!(migration_count, distinct_migration_count);
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM address_book_backfill_state WHERE id = 1 AND completed = 1",
+                )
+                .fetch_one(first.pool.get().await.unwrap().deref_mut())
+                .await
+                .unwrap(),
+                1
+            );
+
+            drop(first);
+            drop(second);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn legacy_migration_waits_for_online_writer_and_includes_its_commit() {
+        run(async {
+            let path = temp_db_path("legacy-online-writer");
+            create_legacy_peer_db(&path, true).await.unwrap();
+            let mut writer = connect(&path).await.unwrap();
+            let mut writer_tx = writer.begin().await.unwrap();
+            sqlx::query(
+                "INSERT INTO peer(guid, id, uuid, pk, note, info)
+                 VALUES(?, ?, ?, ?, ?, ?)",
+            )
+            .bind(TEST_GUID)
+            .bind("online-writer-device")
+            .bind(TEST_UUID)
+            .bind(TEST_PK)
+            .bind("committed-before-migration")
+            .bind("{\"ip\":\"127.0.0.1\"}")
+            .execute(&mut writer_tx)
+            .await
+            .unwrap();
+
+            let migration = Database::new(&path);
+            tokio::pin!(migration);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), migration.as_mut(),)
+                    .await
+                    .is_err(),
+                "迁移不得越过仍在提交中的 legacy writer"
+            );
+            writer_tx.commit().await.unwrap();
+            drop(writer);
+
+            let db = migration.await.unwrap();
+            let migrated = db.get_peer("online-writer-device").await.unwrap().unwrap();
+            assert_eq!(migrated.note.as_deref(), Some("committed-before-migration"));
+            assert!(table_exists(&db, "peer_backup_legacy").await.unwrap());
+
+            drop(db);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn startup_integrity_waits_for_online_bypass_writer_and_rejects_commit() {
+        run(async {
+            let path = temp_db_path("integrity-online-writer");
+            let db = Database::new(&path).await.unwrap();
+            let owner = db
+                .create_user("owner", "hash", None, "user")
+                .await
+                .unwrap()
+                .id;
+            db.insert_peer("device-1", TEST_UUID, TEST_PK, "{}")
+                .await
+                .unwrap();
+            db.update_managed_device(
+                OwnerScope::All,
+                "device-1",
+                &DeviceUpdate {
+                    owner_user_id: Some(Some(owner)),
+                    alias: Some(Some("logged-alias".to_owned())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            drop(db);
+
+            let mut writer = connect(&path).await.unwrap();
+            let mut writer_tx = writer.begin().await.unwrap();
+            sqlx::query(
+                "UPDATE devices
+                 SET alias = 'bypassed-alias'
+                 WHERE device_id = 'device-1'",
+            )
+            .execute(&mut writer_tx)
+            .await
+            .unwrap();
+
+            let startup = Database::new(&path);
+            tokio::pin!(startup);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), startup.as_mut())
+                    .await
+                    .is_err(),
+                "完整性检查不得越过仍持有写事务的 bypass writer"
+            );
+            writer_tx.commit().await.unwrap();
+            drop(writer);
+
+            let error = startup.await.err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("current membership differs from replay"),
+                "unexpected startup error: {error:#}"
+            );
+            assert!(Database::new(&path).await.is_err());
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn migration6_upgrade_rejects_invalid_safe_device_text_fields() {
+        run(async {
+            let cases = [
+                (
+                    "alias-control",
+                    Some("alias\u{0001}".to_owned()),
+                    None,
+                    None,
+                    "设备别名",
+                ),
+                (
+                    "hostname-too-long",
+                    None,
+                    Some("h".repeat(201)),
+                    None,
+                    "设备主机名",
+                ),
+                (
+                    "os-too-long",
+                    None,
+                    None,
+                    Some("o".repeat(101)),
+                    "设备系统名称",
+                ),
+            ];
+
+            for (name, alias, hostname, os, expected) in cases {
+                let path = temp_db_path(name);
+                create_migration6_database(&path).await.unwrap();
+                let mut conn = connect(&path).await.unwrap();
+                let owner_id = sqlx::query(
+                    "INSERT INTO users(username, password_hash) VALUES('owner', 'hash')",
+                )
+                .execute(&mut conn)
+                .await
+                .unwrap()
+                .last_insert_rowid();
+                sqlx::query(
+                    "INSERT INTO devices(
+                         guid, uuid, pk, device_id, owner_user_id,
+                         device_name, os, alias, info
+                     )
+                     VALUES(?, ?, ?, 'legacy-device', ?, ?, ?, ?, '{}')",
+                )
+                .bind(TEST_GUID)
+                .bind(TEST_UUID)
+                .bind(TEST_PK)
+                .bind(owner_id)
+                .bind(hostname)
+                .bind(os)
+                .bind(alias)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+                drop(conn);
+
+                let error = Database::new(&path).await.err().unwrap();
+                assert!(
+                    error.to_string().contains(expected),
+                    "{name} 应在第 7 个迁移后被拒绝：{error:#}"
+                );
+                cleanup(&path);
+            }
         });
     }
 
@@ -1589,6 +2043,7 @@ mod tests {
         std::fs::remove_file(path).ok();
         std::fs::remove_file(format!("{path}-shm")).ok();
         std::fs::remove_file(format!("{path}-wal")).ok();
+        std::fs::remove_file(format!("{path}.migration.lock")).ok();
     }
 
     async fn connect(path: &str) -> ResultType<SqliteConnection> {
@@ -1596,6 +2051,26 @@ mod tests {
             std::fs::File::create(path).ok();
         }
         Ok(SqliteConnection::connect(path).await?)
+    }
+
+    async fn create_migration6_database(path: &str) -> ResultType<()> {
+        const MIGRATION_6_VERSION: i64 = 20260723000006;
+
+        let mut conn = connect(path).await?;
+        conn.ensure_migrations_table().await?;
+        let migrator = sqlx::migrate!();
+        let mut applied = 0;
+        for migration in migrator
+            .iter()
+            .filter(|migration| migration.version <= MIGRATION_6_VERSION)
+        {
+            conn.apply(migration).await?;
+            applied += 1;
+        }
+        if applied != 6 {
+            bail!("地址簿迁移前应恰好存在 6 个迁移，实际为 {applied} 个");
+        }
+        Ok(())
     }
 
     async fn create_legacy_peer_db(path: &str, strict_not_null: bool) -> ResultType<()> {
@@ -1778,6 +2253,17 @@ mod tests {
             "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='index' AND name=?",
         )
         .bind(index)
+        .fetch_one(conn.deref_mut())
+        .await?;
+        Ok(row.try_get::<i64, _>("count")? > 0)
+    }
+
+    async fn trigger_exists(db: &Database, trigger: &str) -> ResultType<bool> {
+        let mut conn = db.pool.get().await?;
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='trigger' AND name=?",
+        )
+        .bind(trigger)
         .fetch_one(conn.deref_mut())
         .await?;
         Ok(row.try_get::<i64, _>("count")? > 0)

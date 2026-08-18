@@ -117,6 +117,17 @@ where
     type Rejection = ApiError;
 
     async fn from_request(request: &mut RequestParts<B>) -> Result<Self, Self::Rejection> {
+        let content_type = request
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap_or_default().trim());
+        if !content_type.is_some_and(|mime| mime.eq_ignore_ascii_case("application/json")) {
+            return Err(ApiError::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Content-Type must be application/json",
+            ));
+        }
         match Json::<T>::from_request(request).await {
             Ok(Json(value)) => Ok(Self(value)),
             Err(JsonRejection::BytesRejection(error)) => Err(bytes_rejection_error(error)),

@@ -1,7 +1,12 @@
-use super::Database;
+use super::{
+    addressbook::{
+        delete_device_memberships_in_tx, upsert_device_memberships_in_tx, AddressBookError,
+    },
+    Database,
+};
 use chrono::NaiveDateTime;
 use hbb_common::{bail, ResultType};
-use sqlx::{Connection, FromRow, QueryBuilder, Row, Sqlite, SqliteConnection, Transaction};
+use sqlx::{Connection, FromRow, QueryBuilder, Row, Sqlite, Transaction};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
@@ -297,6 +302,16 @@ fn pool_error(error: impl fmt::Display) -> InventoryError {
     InventoryError::Internal(error.to_string())
 }
 
+fn address_book_error(error: AddressBookError) -> InventoryError {
+    match error {
+        AddressBookError::Busy => InventoryError::Busy,
+        AddressBookError::NotFound => InventoryError::NotFound,
+        AddressBookError::TooLarge => InventoryError::TooLarge,
+        AddressBookError::Conflict(code) => InventoryError::Conflict(code),
+        other => InventoryError::Internal(other.to_string()),
+    }
+}
+
 fn scope_allows_owner(scope: OwnerScope, owner_user_id: Option<i64>) -> bool {
     match scope {
         OwnerScope::All => true,
@@ -304,7 +319,7 @@ fn scope_allows_owner(scope: OwnerScope, owner_user_id: Option<i64>) -> bool {
     }
 }
 
-async fn lock_inventory(tx: &mut Transaction<'_, Sqlite>) -> InventoryResult<()> {
+pub(super) async fn lock_inventory(tx: &mut Transaction<'_, Sqlite>) -> InventoryResult<()> {
     sqlx::query("UPDATE inventory_write_lock SET version = version + 1 WHERE id = 1")
         .execute(&mut *tx)
         .await?;
@@ -1021,6 +1036,9 @@ impl Database {
                     return Err(InventoryError::NotFound);
                 }
             }
+            delete_device_memberships_in_tx(&mut tx, current.row_id)
+                .await
+                .map_err(address_book_error)?;
             sqlx::query("DELETE FROM device_tags WHERE device_row_id = ?")
                 .bind(current.row_id)
                 .execute(&mut tx)
@@ -1032,6 +1050,7 @@ impl Database {
             None if owner_changed => None,
             None => current.alias.clone(),
         };
+        let alias_changed = final_alias != current.alias;
         let final_note = match &update.note {
             Some(value) => value.clone(),
             None if owner_changed => None,
@@ -1080,6 +1099,15 @@ impl Database {
         .await?;
         if owner_changed {
             delete_orphan_tags_in_tx(&mut tx).await?;
+            if final_owner.is_some() {
+                upsert_device_memberships_in_tx(&mut tx, current.row_id)
+                    .await
+                    .map_err(address_book_error)?;
+            }
+        } else if alias_changed {
+            upsert_device_memberships_in_tx(&mut tx, current.row_id)
+                .await
+                .map_err(address_book_error)?;
         }
         let updated = fetch_managed_device_in_tx(&mut tx, OwnerScope::All, device_id).await?;
         tx.commit().await?;
@@ -1424,6 +1452,10 @@ impl Database {
             return Ok(DeviceDeleteOutcome::CapacityFull);
         }
 
+        delete_device_memberships_in_tx(&mut tx, row_id)
+            .await
+            .map_err(address_book_error)?;
+
         let mut delete_query = QueryBuilder::<Sqlite>::new("DELETE FROM devices WHERE id = ");
         delete_query.push_bind(row_id);
         delete_query.push(" AND device_id = ");
@@ -1596,9 +1628,7 @@ impl Database {
     }
 }
 
-pub(super) async fn verify_inventory_integrity(
-    connection: &mut SqliteConnection,
-) -> ResultType<()> {
+pub(super) async fn verify_inventory_integrity(tx: &mut Transaction<'_, Sqlite>) -> ResultType<()> {
     if let Some(row) = sqlx::query(
         "SELECT child.id
          FROM groups child
@@ -1606,7 +1636,7 @@ pub(super) async fn verify_inventory_integrity(
          WHERE child.parent_group_id IS NOT NULL AND parent.id IS NULL
          LIMIT 1",
     )
-    .fetch_optional(&mut *connection)
+    .fetch_optional(&mut *tx)
     .await?
     {
         bail!(
@@ -1621,7 +1651,7 @@ pub(super) async fn verify_inventory_integrity(
          WHERE child.owner_user_id <> parent.owner_user_id
          LIMIT 1",
     )
-    .fetch_optional(&mut *connection)
+    .fetch_optional(&mut *tx)
     .await?
     {
         bail!(
@@ -1645,7 +1675,7 @@ pub(super) async fn verify_inventory_integrity(
          WHERE start_id = id
          LIMIT 1",
     )
-    .fetch_optional(&mut *connection)
+    .fetch_optional(&mut *tx)
     .await?
     {
         bail!(
@@ -1668,7 +1698,7 @@ pub(super) async fn verify_inventory_integrity(
          WHERE depth > 256
          LIMIT 1",
     )
-    .fetch_optional(&mut *connection)
+    .fetch_optional(&mut *tx)
     .await?
     {
         bail!(
@@ -1684,7 +1714,7 @@ pub(super) async fn verify_inventory_integrity(
             OR device.owner_user_id <> grouped.owner_user_id
          LIMIT 1",
     )
-    .fetch_optional(&mut *connection)
+    .fetch_optional(&mut *tx)
     .await?
     {
         bail!(
@@ -1701,7 +1731,7 @@ pub(super) async fn verify_inventory_integrity(
             OR management_generation GLOB '*[^0-9a-f]*'
          LIMIT 1",
     )
-    .fetch_optional(&mut *connection)
+    .fetch_optional(&mut *tx)
     .await?
     {
         bail!(
@@ -1716,7 +1746,7 @@ pub(super) async fn verify_inventory_integrity(
          HAVING COUNT(*) > 1
          LIMIT 1",
     )
-    .fetch_optional(&mut *connection)
+    .fetch_optional(&mut *tx)
     .await?
     {
         bail!(
@@ -1733,7 +1763,7 @@ pub(super) async fn verify_inventory_integrity(
             OR device.owner_user_id <> tag.owner_user_id
          LIMIT 1",
     )
-    .fetch_optional(&mut *connection)
+    .fetch_optional(&mut *tx)
     .await?
     {
         bail!(
@@ -1743,7 +1773,7 @@ pub(super) async fn verify_inventory_integrity(
         );
     }
     if let Some(row) = sqlx::query("PRAGMA foreign_key_check")
-        .fetch_optional(&mut *connection)
+        .fetch_optional(&mut *tx)
         .await?
     {
         let table = row.try_get::<String, _>("table")?;
@@ -1793,6 +1823,7 @@ mod tests {
             path.to_owned(),
             format!("{path}-wal"),
             format!("{path}-shm"),
+            format!("{path}.migration.lock"),
         ] {
             if Path::new(&candidate).exists() {
                 let _ = std::fs::remove_file(candidate);
@@ -1816,15 +1847,14 @@ mod tests {
         let mut connection = db.pool.get().await.unwrap();
         sqlx::query(
             "INSERT INTO devices(
-                 guid, uuid, pk, device_id, owner_user_id, info, status, last_seen
+                 guid, uuid, pk, device_id, info, status, last_seen
              )
-             VALUES(?, ?, ?, ?, ?, '{}', 'offline', current_timestamp)",
+             VALUES(?, ?, ?, ?, '{}', 'offline', current_timestamp)",
         )
         .bind(&guid)
         .bind(b"test-uuid".as_slice())
         .bind(b"test-public-key".as_slice())
         .bind(device_id)
-        .bind(owner_user_id)
         .execute(connection.deref_mut())
         .await
         .unwrap();
@@ -1835,6 +1865,19 @@ mod tests {
         .fetch_one(connection.deref_mut())
         .await
         .unwrap();
+        drop(connection);
+        if let Some(owner_user_id) = owner_user_id {
+            db.update_managed_device(
+                OwnerScope::All,
+                device_id,
+                &DeviceUpdate {
+                    owner_user_id: Some(Some(owner_user_id)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
         (guid, generation)
     }
 

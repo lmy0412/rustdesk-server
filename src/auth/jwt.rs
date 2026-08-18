@@ -1,4 +1,7 @@
-use crate::{config::ProConfig, models::user::User};
+use crate::{
+    config::ProConfig,
+    models::user::{User, MAX_SAFE_INTEGER},
+};
 use chrono::Utc;
 use jsonwebtoken::{
     decode, encode, errors::ErrorKind, DecodingKey, EncodingKey, Header, Validation,
@@ -74,6 +77,7 @@ impl fmt::Display for JwtError {
 impl Error for JwtError {}
 
 pub fn sign_token(user: &User, secret: &str, expiry_hours: i64) -> Result<String, JwtError> {
+    validate_claim_numbers(user.id, user.token_version)?;
     let now = Utc::now().timestamp();
     let exp = now + expiry_hours * 3600;
     let claims = Claims {
@@ -94,6 +98,7 @@ pub fn sign_token(user: &User, secret: &str, expiry_hours: i64) -> Result<String
 }
 
 pub fn sign_refresh_token(user: &User, secret: &str, expiry_days: i64) -> Result<String, JwtError> {
+    validate_claim_numbers(user.id, user.token_version)?;
     let now = Utc::now().timestamp();
     let exp = now + expiry_days * 24 * 3600;
     let claims = RefreshClaims {
@@ -119,8 +124,11 @@ pub fn verify_token(token: &str, secret: &str) -> Result<Claims, JwtError> {
         &Validation::default(),
     )
     .map(|data| {
-        if data.claims.typ == TOKEN_TYPE_ACCESS {
-            Ok(data.claims)
+        let claims = data.claims;
+        if claims.typ == TOKEN_TYPE_ACCESS
+            && validate_claim_numbers(claims.sub, claims.token_ver).is_ok()
+        {
+            Ok(claims)
         } else {
             Err(JwtError::InvalidToken)
         }
@@ -135,13 +143,25 @@ pub fn verify_refresh_token(token: &str, secret: &str) -> Result<(i64, i64), Jwt
         &Validation::default(),
     )
     .map(|data| {
-        if data.claims.typ == TOKEN_TYPE_REFRESH {
-            Ok((data.claims.sub, data.claims.token_ver))
+        let claims = data.claims;
+        if claims.typ == TOKEN_TYPE_REFRESH
+            && validate_claim_numbers(claims.sub, claims.token_ver).is_ok()
+        {
+            Ok((claims.sub, claims.token_ver))
         } else {
             Err(JwtError::InvalidToken)
         }
     })
     .map_err(map_decode_error)?
+}
+
+fn validate_claim_numbers(user_id: i64, token_version: i64) -> Result<(), JwtError> {
+    if !(1..=MAX_SAFE_INTEGER).contains(&user_id)
+        || !(0..=MAX_SAFE_INTEGER).contains(&token_version)
+    {
+        return Err(JwtError::InvalidToken);
+    }
+    Ok(())
 }
 
 fn map_decode_error(err: jsonwebtoken::errors::Error) -> JwtError {
@@ -213,6 +233,70 @@ mod tests {
         let token = sign_refresh_token(&user, "secret", 1).unwrap();
         assert!(matches!(
             verify_token(&token, "secret"),
+            Err(JwtError::InvalidToken)
+        ));
+    }
+
+    #[test]
+    fn signing_rejects_claim_numbers_outside_json_safe_integer_range() {
+        let mut user = fake_user();
+        user.id = MAX_SAFE_INTEGER + 1;
+        assert!(matches!(
+            sign_token(&user, "secret", 1),
+            Err(JwtError::InvalidToken)
+        ));
+        assert!(matches!(
+            sign_refresh_token(&user, "secret", 1),
+            Err(JwtError::InvalidToken)
+        ));
+
+        user.id = 1;
+        user.token_version = MAX_SAFE_INTEGER + 1;
+        assert!(matches!(
+            sign_token(&user, "secret", 1),
+            Err(JwtError::InvalidToken)
+        ));
+        assert!(matches!(
+            sign_refresh_token(&user, "secret", 1),
+            Err(JwtError::InvalidToken)
+        ));
+    }
+
+    #[test]
+    fn verification_rejects_forged_unsafe_access_and_refresh_claims() {
+        let now = Utc::now().timestamp() as usize;
+        let access = encode(
+            &Header::default(),
+            &Claims {
+                typ: TOKEN_TYPE_ACCESS.to_string(),
+                sub: MAX_SAFE_INTEGER + 1,
+                role: "user".to_string(),
+                token_ver: 0,
+                exp: now + 3600,
+                iat: now,
+            },
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_token(&access, "secret"),
+            Err(JwtError::InvalidToken)
+        ));
+
+        let refresh = encode(
+            &Header::default(),
+            &RefreshClaims {
+                typ: TOKEN_TYPE_REFRESH.to_string(),
+                sub: 1,
+                token_ver: MAX_SAFE_INTEGER + 1,
+                exp: now + 3600,
+                iat: now,
+            },
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_refresh_token(&refresh, "secret"),
             Err(JwtError::InvalidToken)
         ));
     }

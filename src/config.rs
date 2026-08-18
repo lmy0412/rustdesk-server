@@ -76,6 +76,54 @@ fn default_downgrade_threshold() -> f64 {
 fn default_downgrade_start_check() -> u64 {
     1800
 }
+fn default_api_max_in_flight() -> usize {
+    1024
+}
+fn default_telemetry_max_in_flight() -> usize {
+    768
+}
+fn default_auth_max_in_flight() -> usize {
+    64
+}
+fn default_argon2_max_in_flight() -> usize {
+    8
+}
+fn default_api_request_timeout_ms() -> u64 {
+    10_000
+}
+fn default_telemetry_peer_capacity() -> u64 {
+    36_000
+}
+fn default_telemetry_peer_refill_per_minute() -> u64 {
+    18_000
+}
+fn default_auth_peer_capacity() -> u64 {
+    60
+}
+fn default_auth_peer_refill_per_minute() -> u64 {
+    30
+}
+fn default_device_capacity() -> u64 {
+    120
+}
+fn default_device_refill_per_minute() -> u64 {
+    60
+}
+fn default_address_book_actor_capacity() -> u64 {
+    30
+}
+fn default_address_book_actor_refill_per_minute() -> u64 {
+    15
+}
+fn default_peer_lru_capacity() -> usize {
+    10_000
+}
+fn default_device_lru_capacity() -> usize {
+    100_000
+}
+fn default_actor_lru_capacity() -> usize {
+    100_000
+}
 
 // ==========================
 // Config structs
@@ -296,6 +344,66 @@ impl Default for ServerConfig {
     }
 }
 
+/// API 入口的资源保护配置。全部字段为冷配置，修改后必须重启进程。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiRateLimitConfig {
+    #[serde(default = "default_api_max_in_flight")]
+    pub max_in_flight: usize,
+    #[serde(default = "default_telemetry_max_in_flight")]
+    pub telemetry_max_in_flight: usize,
+    #[serde(default = "default_auth_max_in_flight")]
+    pub auth_max_in_flight: usize,
+    #[serde(default = "default_argon2_max_in_flight")]
+    pub argon2_max_in_flight: usize,
+    #[serde(default = "default_api_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+    #[serde(default = "default_telemetry_peer_capacity")]
+    pub telemetry_peer_capacity: u64,
+    #[serde(default = "default_telemetry_peer_refill_per_minute")]
+    pub telemetry_peer_refill_per_minute: u64,
+    #[serde(default = "default_auth_peer_capacity")]
+    pub auth_peer_capacity: u64,
+    #[serde(default = "default_auth_peer_refill_per_minute")]
+    pub auth_peer_refill_per_minute: u64,
+    #[serde(default = "default_device_capacity")]
+    pub device_capacity: u64,
+    #[serde(default = "default_device_refill_per_minute")]
+    pub device_refill_per_minute: u64,
+    #[serde(default = "default_address_book_actor_capacity")]
+    pub address_book_actor_capacity: u64,
+    #[serde(default = "default_address_book_actor_refill_per_minute")]
+    pub address_book_actor_refill_per_minute: u64,
+    #[serde(default = "default_peer_lru_capacity")]
+    pub peer_lru_capacity: usize,
+    #[serde(default = "default_device_lru_capacity")]
+    pub device_lru_capacity: usize,
+    #[serde(default = "default_actor_lru_capacity")]
+    pub actor_lru_capacity: usize,
+}
+
+impl Default for ApiRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_in_flight: default_api_max_in_flight(),
+            telemetry_max_in_flight: default_telemetry_max_in_flight(),
+            auth_max_in_flight: default_auth_max_in_flight(),
+            argon2_max_in_flight: default_argon2_max_in_flight(),
+            request_timeout_ms: default_api_request_timeout_ms(),
+            telemetry_peer_capacity: default_telemetry_peer_capacity(),
+            telemetry_peer_refill_per_minute: default_telemetry_peer_refill_per_minute(),
+            auth_peer_capacity: default_auth_peer_capacity(),
+            auth_peer_refill_per_minute: default_auth_peer_refill_per_minute(),
+            device_capacity: default_device_capacity(),
+            device_refill_per_minute: default_device_refill_per_minute(),
+            address_book_actor_capacity: default_address_book_actor_capacity(),
+            address_book_actor_refill_per_minute: default_address_book_actor_refill_per_minute(),
+            peer_lru_capacity: default_peer_lru_capacity(),
+            device_lru_capacity: default_device_lru_capacity(),
+            actor_lru_capacity: default_actor_lru_capacity(),
+        }
+    }
+}
+
 /// Top-level application configuration
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -307,6 +415,8 @@ pub struct AppConfig {
     pub relay: RelayConfig,
     #[serde(default)]
     pub pro: ProConfig,
+    #[serde(default)]
+    pub api_rate_limit: ApiRateLimitConfig,
 }
 
 impl Default for AppConfig {
@@ -316,6 +426,7 @@ impl Default for AppConfig {
             rendezvous: RendezvousConfig::default(),
             relay: RelayConfig::default(),
             pro: ProConfig::default(),
+            api_rate_limit: ApiRateLimitConfig::default(),
         }
     }
 }
@@ -507,12 +618,38 @@ impl fmt::Display for ServerConfig {
     }
 }
 
+impl fmt::Display for ApiRateLimitConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ApiRateLimitConfig {{ max_in_flight: {}, telemetry_max_in_flight: {}, auth_max_in_flight: {}, argon2_max_in_flight: {}, request_timeout_ms: {}, telemetry_peer: {}/{}, auth_peer: {}/{}, device: {}/{}, address_book_actor: {}/{}, peer_lru_capacity: {}, device_lru_capacity: {}, actor_lru_capacity: {} }}",
+            self.max_in_flight,
+            self.telemetry_max_in_flight,
+            self.auth_max_in_flight,
+            self.argon2_max_in_flight,
+            self.request_timeout_ms,
+            self.telemetry_peer_capacity,
+            self.telemetry_peer_refill_per_minute,
+            self.auth_peer_capacity,
+            self.auth_peer_refill_per_minute,
+            self.device_capacity,
+            self.device_refill_per_minute,
+            self.address_book_actor_capacity,
+            self.address_book_actor_refill_per_minute,
+            self.peer_lru_capacity,
+            self.device_lru_capacity,
+            self.actor_lru_capacity,
+        )
+    }
+}
+
 impl fmt::Display for AppConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "{}", self.server)?;
         writeln!(f, "{}", self.rendezvous)?;
         writeln!(f, "{}", self.relay)?;
-        write!(f, "{}", self.pro)
+        writeln!(f, "{}", self.pro)?;
+        write!(f, "{}", self.api_rate_limit)
     }
 }
 
@@ -1049,6 +1186,75 @@ fn validate_config(cfg: &AppConfig) -> Result<(), String> {
         return Err("pro.refresh_expiry_days must be positive".to_string());
     }
     validate_allowed_origins(&cfg.pro.oidc.allowed_origins)?;
+    validate_api_rate_limit(&cfg.api_rate_limit)?;
+    Ok(())
+}
+
+fn validate_api_rate_limit(cfg: &ApiRateLimitConfig) -> Result<(), String> {
+    const MAX_CONCURRENCY: usize = 65_535;
+    const MAX_BUCKET_VALUE: u64 = 1_000_000;
+    const MAX_LRU_CAPACITY: usize = 1_000_000;
+
+    for (name, value) in [
+        ("max_in_flight", cfg.max_in_flight),
+        ("telemetry_max_in_flight", cfg.telemetry_max_in_flight),
+        ("auth_max_in_flight", cfg.auth_max_in_flight),
+        ("argon2_max_in_flight", cfg.argon2_max_in_flight),
+    ] {
+        if value == 0 || value > MAX_CONCURRENCY {
+            return Err(format!(
+                "api_rate_limit.{name} must be within 1..={MAX_CONCURRENCY}"
+            ));
+        }
+    }
+    if cfg.telemetry_max_in_flight + cfg.auth_max_in_flight >= cfg.max_in_flight {
+        return Err(
+            "api_rate_limit telemetry/auth concurrency must leave capacity for other APIs"
+                .to_string(),
+        );
+    }
+    if !(100..=60_000).contains(&cfg.request_timeout_ms) {
+        return Err("api_rate_limit.request_timeout_ms must be within 100..=60000".to_string());
+    }
+    for (name, value) in [
+        ("telemetry_peer_capacity", cfg.telemetry_peer_capacity),
+        (
+            "telemetry_peer_refill_per_minute",
+            cfg.telemetry_peer_refill_per_minute,
+        ),
+        ("auth_peer_capacity", cfg.auth_peer_capacity),
+        (
+            "auth_peer_refill_per_minute",
+            cfg.auth_peer_refill_per_minute,
+        ),
+        ("device_capacity", cfg.device_capacity),
+        ("device_refill_per_minute", cfg.device_refill_per_minute),
+        (
+            "address_book_actor_capacity",
+            cfg.address_book_actor_capacity,
+        ),
+        (
+            "address_book_actor_refill_per_minute",
+            cfg.address_book_actor_refill_per_minute,
+        ),
+    ] {
+        if value == 0 || value > MAX_BUCKET_VALUE {
+            return Err(format!(
+                "api_rate_limit.{name} must be within 1..={MAX_BUCKET_VALUE}"
+            ));
+        }
+    }
+    for (name, value) in [
+        ("peer_lru_capacity", cfg.peer_lru_capacity),
+        ("device_lru_capacity", cfg.device_lru_capacity),
+        ("actor_lru_capacity", cfg.actor_lru_capacity),
+    ] {
+        if value == 0 || value > MAX_LRU_CAPACITY {
+            return Err(format!(
+                "api_rate_limit.{name} must be within 1..={MAX_LRU_CAPACITY}"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1282,6 +1488,12 @@ fn diff_fields(old: &AppConfig, new: &AppConfig) -> Vec<String> {
     );
     push_diff(&mut fields, "pro.oidc", &old.pro.oidc, &new.pro.oidc);
     push_diff(&mut fields, "pro.smtp", &old.pro.smtp, &new.pro.smtp);
+    push_diff(
+        &mut fields,
+        "api_rate_limit",
+        &old.api_rate_limit,
+        &new.api_rate_limit,
+    );
     fields
 }
 
@@ -1756,6 +1968,39 @@ id_server = "127.0.0.1:21116"
         let err = AppConfig::load_from_path(Some(&path), ConfigTarget::Hbbs).unwrap_err();
         assert!(err.contains("bind all interfaces"));
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_api_rate_limit_defaults_and_invalid_combinations() {
+        let defaults = ApiRateLimitConfig::default();
+        assert_eq!(defaults.max_in_flight, 1024);
+        assert_eq!(defaults.telemetry_max_in_flight, 768);
+        assert_eq!(defaults.auth_max_in_flight, 64);
+        assert!(validate_api_rate_limit(&defaults).is_ok());
+
+        let mut invalid = defaults.clone();
+        invalid.auth_max_in_flight = invalid.max_in_flight;
+        assert!(validate_api_rate_limit(&invalid).is_err());
+        invalid = defaults.clone();
+        invalid.auth_max_in_flight = invalid.max_in_flight - invalid.telemetry_max_in_flight;
+        assert!(validate_api_rate_limit(&invalid).is_err());
+        invalid = defaults.clone();
+        invalid.request_timeout_ms = 99;
+        assert!(validate_api_rate_limit(&invalid).is_err());
+        invalid = defaults;
+        invalid.peer_lru_capacity = 0;
+        assert!(validate_api_rate_limit(&invalid).is_err());
+    }
+
+    #[test]
+    fn test_api_rate_limit_changes_are_cold_reload_fields() {
+        let old = AppConfig::default();
+        let mut new = old.clone();
+        new.api_rate_limit.auth_peer_capacity += 1;
+        let result = old.diff_reload(&new);
+        assert_eq!(result.hot_applied, 0);
+        assert_eq!(result.cold, 1);
+        assert_eq!(result.changed_fields, vec!["api_rate_limit"]);
     }
 
     fn hbbs_matches(args: &[&str]) -> clap::ArgMatches<'static> {
