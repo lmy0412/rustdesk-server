@@ -16,14 +16,14 @@ pub fn cookie_same_site(config: &OidcConfig) -> SameSite {
 pub fn access_token_cookie(
     token: String,
     config: &OidcConfig,
-    expiry_hours: i64,
+    expiry_seconds: i64,
 ) -> Cookie<'static> {
     Cookie::build(ACCESS_TOKEN_COOKIE, token)
         .http_only(true)
         .secure(true)
         .same_site(cookie_same_site(config))
         .path("/")
-        .max_age(Duration::hours(expiry_hours))
+        .max_age(Duration::seconds(expiry_seconds))
         .finish()
 }
 

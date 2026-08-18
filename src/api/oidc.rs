@@ -1,16 +1,19 @@
 use crate::{
+    api::auth_service::sign_access_token,
+    audit::{AuditEvent, AuditService},
     auth::{
         access_token_cookie,
-        jwt::{sign_refresh_token, sign_token, AuthState},
+        jwt::{sign_refresh_token, AuthState},
         oidc_http::oidc_http_client,
         refresh_token_cookie, OIDC_SESSIONS,
     },
     config::OidcConfig,
     database::Database,
     models::user::{validate_username, User},
+    security::SecurityPolicyState,
 };
 use axum::{
-    extract::{Extension, Query},
+    extract::{connect_info::ConnectInfo, Extension, Query},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -24,6 +27,7 @@ use openidconnect::{
 };
 use serde_derive::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 
 type ApiError = (StatusCode, Json<Value>);
 
@@ -80,10 +84,14 @@ pub async fn handle_oidc_login(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_oidc_callback(
     Extension(db): Extension<Database>,
     Extension(auth_state): Extension<AuthState>,
     Extension(oidc_config): Extension<OidcConfig>,
+    Extension(security): Extension<SecurityPolicyState>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     jar: CookieJar,
     Query(query): Query<OidcCallbackQuery>,
 ) -> Response {
@@ -168,14 +176,36 @@ pub async fn handle_oidc_callback(
     };
 
     if !user.is_active {
+        audit.record(
+            AuditEvent::new("auth.login.failure")
+                .actor(user.id)
+                .target("user", user.id.to_string())
+                .ip(peer.ip())
+                .detail(json!({"method": "oidc", "reason": "account_disabled"})),
+        );
         return redirect_error(&oidc_config, "account_disabled");
     }
+    if user.role == "admin" {
+        match security.admin_ip_allowed(peer.ip()) {
+            Ok(true) => {}
+            Ok(false) => {
+                audit.record(
+                    AuditEvent::new("auth.login.ip_denied")
+                        .actor(user.id)
+                        .target("user", user.id.to_string())
+                        .ip(peer.ip())
+                        .detail(json!({"method": "oidc", "reason": "admin_ip_not_allowed"})),
+                );
+                return redirect_error(&oidc_config, "admin_ip_not_allowed");
+            }
+            Err(_) => return redirect_error(&oidc_config, "internal_error"),
+        }
+    }
 
-    let access_token = match sign_token(&user, &auth_state.jwt_secret, auth_state.jwt_expiry_hours)
-    {
+    let (access_token, access_lifetime) = match sign_access_token(&user, &auth_state, &security) {
         Ok(token) => token,
-        Err(err) => {
-            log::error!("OIDC access token sign failed: {}", err);
+        Err(_) => {
+            log::error!("OIDC access token sign failed");
             return redirect_error(&oidc_config, "internal_error");
         }
     };
@@ -195,13 +225,20 @@ pub async fn handle_oidc_callback(
         .add(access_token_cookie(
             access_token,
             &oidc_config,
-            auth_state.jwt_expiry_hours,
+            access_lifetime,
         ))
         .add(refresh_token_cookie(
             refresh_token,
             &oidc_config,
             auth_state.refresh_expiry_days,
         ));
+    audit.record(
+        AuditEvent::new("auth.login.success")
+            .actor(user.id)
+            .target("user", user.id.to_string())
+            .ip(peer.ip())
+            .detail(json!({"method": "oidc"})),
+    );
     redirect_with_jar(jar, &oidc_config.post_login_url)
 }
 

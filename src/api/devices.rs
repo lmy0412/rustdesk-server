@@ -5,6 +5,7 @@ use crate::{
         },
         device_deletion,
     },
+    audit::{resource_fingerprint, AuditEvent, AuditService},
     auth::jwt::CurrentUser,
     database::{Database, DeviceListFilter, DeviceUpdate, ManagedDevice},
     models::device::{
@@ -13,9 +14,11 @@ use crate::{
     },
 };
 use axum::{
-    extract::{Extension, Path, Query},
+    extract::{connect_info::ConnectInfo, Extension, Path, Query},
     Json,
 };
+use serde_json::json;
+use std::net::SocketAddr;
 
 pub use device_deletion::handle_delete_device;
 
@@ -66,6 +69,8 @@ pub async fn handle_get_device(
 pub async fn handle_update_device(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     Path(device_id): Path<String>,
     LimitedJson(payload): LimitedJson<UpdateDeviceRequest>,
 ) -> Result<Json<DeviceResponse>, ApiError> {
@@ -89,12 +94,21 @@ pub async fn handle_update_device(
         .await
         .map_err(|error| inventory_error(error, "update device failed"))?
         .ok_or_else(|| ApiError::not_found("device"))?;
+    audit.record(
+        AuditEvent::new("device.update")
+            .actor(current.id)
+            .target("device", resource_fingerprint(&device_id))
+            .ip(peer.ip())
+            .detail(json!({"group_id": device.group_id, "owner_user_id": device.owner_user_id})),
+    );
     Ok(Json(device_response(device)))
 }
 
 pub async fn handle_batch_tag(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     LimitedJson(payload): LimitedJson<BatchTagRequest>,
 ) -> Result<Json<BatchTagResponse>, ApiError> {
     let payload = payload.validate().map_err(validation_error)?;
@@ -108,6 +122,8 @@ pub async fn handle_batch_tag(
         )
         .await
         .map_err(|error| inventory_error(error, "batch update device tags failed"))?;
+    let batch_fingerprint = resource_fingerprint(&payload.device_ids.join("\n"));
+    audit.record(AuditEvent::new("device.tags.update").actor(current.id).target("device_batch", batch_fingerprint).ip(peer.ip()).detail(json!({"matched_devices": outcome.devices, "added_relations": outcome.added, "removed_relations": outcome.removed})));
     Ok(Json(BatchTagResponse {
         matched_devices: outcome.devices,
         added_relations: outcome.added,

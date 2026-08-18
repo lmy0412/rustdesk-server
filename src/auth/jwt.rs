@@ -48,6 +48,13 @@ pub struct CurrentUser {
     pub role: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshIdentity {
+    pub user_id: i64,
+    pub token_version: i64,
+    pub issued_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RefreshClaims {
     typ: String,
@@ -77,9 +84,22 @@ impl fmt::Display for JwtError {
 impl Error for JwtError {}
 
 pub fn sign_token(user: &User, secret: &str, expiry_hours: i64) -> Result<String, JwtError> {
+    let expiry_seconds = expiry_hours
+        .checked_mul(3600)
+        .ok_or(JwtError::InvalidToken)?;
+    sign_token_seconds(user, secret, expiry_seconds)
+}
+
+pub fn sign_token_seconds(
+    user: &User,
+    secret: &str,
+    expiry_seconds: i64,
+) -> Result<String, JwtError> {
     validate_claim_numbers(user.id, user.token_version)?;
     let now = Utc::now().timestamp();
-    let exp = now + expiry_hours * 3600;
+    let exp = now
+        .checked_add(expiry_seconds)
+        .ok_or(JwtError::InvalidToken)?;
     let claims = Claims {
         typ: TOKEN_TYPE_ACCESS.to_string(),
         sub: user.id,
@@ -136,7 +156,7 @@ pub fn verify_token(token: &str, secret: &str) -> Result<Claims, JwtError> {
     .map_err(map_decode_error)?
 }
 
-pub fn verify_refresh_token(token: &str, secret: &str) -> Result<(i64, i64), JwtError> {
+pub fn verify_refresh_token(token: &str, secret: &str) -> Result<RefreshIdentity, JwtError> {
     decode::<RefreshClaims>(
         token,
         &DecodingKey::from_secret(secret.as_bytes()),
@@ -147,7 +167,11 @@ pub fn verify_refresh_token(token: &str, secret: &str) -> Result<(i64, i64), Jwt
         if claims.typ == TOKEN_TYPE_REFRESH
             && validate_claim_numbers(claims.sub, claims.token_ver).is_ok()
         {
-            Ok((claims.sub, claims.token_ver))
+            Ok(RefreshIdentity {
+                user_id: claims.sub,
+                token_version: claims.token_ver,
+                issued_at: i64::try_from(claims.iat).map_err(|_| JwtError::InvalidToken)?,
+            })
         } else {
             Err(JwtError::InvalidToken)
         }
@@ -189,6 +213,8 @@ mod tests {
             role: "admin".to_string(),
             is_active: true,
             token_version: 3,
+            failed_login_count: 0,
+            locked_until: None,
             oauth_provider: None,
             oauth_subject: None,
             last_login_at: None,
@@ -212,9 +238,9 @@ mod tests {
     fn test_refresh_token_contains_token_version() {
         let user = fake_user();
         let token = sign_refresh_token(&user, "secret", 1).unwrap();
-        let (user_id, token_ver) = verify_refresh_token(&token, "secret").unwrap();
-        assert_eq!(user_id, 7);
-        assert_eq!(token_ver, 3);
+        let identity = verify_refresh_token(&token, "secret").unwrap();
+        assert_eq!(identity.user_id, 7);
+        assert_eq!(identity.token_version, 3);
     }
 
     #[test]

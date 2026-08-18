@@ -8,20 +8,24 @@ use crate::{
             cache_token_rejection, is_token_cached_rejected, token_cache_scope, ApiProtectionState,
         },
     },
+    audit::{AuditEvent, AuditService},
     auth::jwt::{verify_token, AuthState, CurrentUser},
     database::Database,
     models::user::{validate_safe_user_id, User},
+    security::SecurityPolicyState,
 };
 use axum::{
     body::Bytes,
-    extract::Extension,
+    extract::{connect_info::ConnectInfo, Extension},
     http::{header, HeaderMap, Request, StatusCode},
     middleware::Next,
     response::Response,
     Json,
 };
 use serde_derive::{Deserialize, Serialize};
+use serde_json::json;
 use serde_json::Value;
+use std::net::SocketAddr;
 
 const MAX_DEVICE_ID_SCALARS: usize = 100;
 const MAX_UUID_BYTES: usize = 64;
@@ -126,10 +130,14 @@ impl std::fmt::Debug for ClientLoginResponse {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_client_login(
     Extension(db): Extension<Database>,
     Extension(auth_state): Extension<AuthState>,
     Extension(protection): Extension<ApiProtectionState>,
+    Extension(security): Extension<SecurityPolicyState>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<ClientLoginResponse>, ApiError> {
@@ -143,11 +151,21 @@ pub async fn handle_client_login(
     let user = verify_password_and_load_active_user(
         &db,
         &protection,
+        &security,
+        &audit,
+        peer.ip(),
         &payload.username,
         &payload.password,
     )
     .await?;
-    let access_token = sign_access_token(&user, &auth_state)?;
+    let (access_token, _) = sign_access_token(&user, &auth_state, &security)?;
+    audit.record(
+        AuditEvent::new("auth.login.success")
+            .actor(user.id)
+            .target("user", user.id.to_string())
+            .ip(peer.ip())
+            .detail(json!({"method": "client_password"})),
+    );
     let user = ClientUserDto::try_from(user)?;
     Ok(Json(ClientLoginResponse {
         response_type: "access_token",
@@ -174,11 +192,20 @@ pub async fn handle_current_user(
 pub async fn handle_client_logout(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     parse_optional_identity(&headers, &body)?;
     revoke_all_user_tokens(&db, current.id).await?;
+    audit.record(
+        AuditEvent::new("auth.logout")
+            .actor(current.id)
+            .target("user", current.id.to_string())
+            .ip(peer.ip())
+            .detail(json!({"client": true})),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -219,8 +246,18 @@ async fn authenticate_explicit_header<B>(
         .get::<AuthState>()
         .cloned()
         .ok_or_else(|| ApiError::internal("auth state not available"))?;
+    let security = request
+        .extensions()
+        .get::<SecurityPolicyState>()
+        .cloned()
+        .ok_or_else(|| ApiError::internal("security policy not available"))?;
     let claims = verify_token(token, &auth_state.jwt_secret)
         .map_err(|_| ApiError::new(StatusCode::UNAUTHORIZED, "invalid token"))?;
+    let issued_at = i64::try_from(claims.iat)
+        .map_err(|_| ApiError::new(StatusCode::UNAUTHORIZED, "invalid token"))?;
+    security
+        .validate_session_issued_at(issued_at)
+        .map_err(|_| ApiError::new(StatusCode::UNAUTHORIZED, "session expired"))?;
     let cache_scope = token_cache_scope(&auth_state.jwt_secret, db.auth_cache_scope());
     if is_token_cached_rejected(cache_scope, claims.sub, claims.token_ver) {
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "token revoked"));
@@ -248,6 +285,30 @@ async fn authenticate_explicit_header<B>(
     match user.role.as_str() {
         "admin" | "user" | "viewer" => {}
         _ => return Err(ApiError::forbidden("unknown role is not permitted")),
+    }
+    if user.role == "admin" {
+        let peer = request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|peer| peer.0.ip())
+            .ok_or_else(|| {
+                ApiError::service_unavailable("peer address unavailable; request rejected")
+            })?;
+        if !security
+            .admin_ip_allowed(peer)
+            .map_err(|_| ApiError::internal("administrator IP policy check failed"))?
+        {
+            if let Some(audit) = request.extensions().get::<AuditService>() {
+                audit.record(
+                    AuditEvent::new("auth.session.ip_denied")
+                        .actor(user.id)
+                        .target("user", user.id.to_string())
+                        .ip(peer)
+                        .detail(json!({"reason": "admin_ip_not_allowed"})),
+                );
+            }
+            return Err(ApiError::forbidden("administrator IP is not allowed"));
+        }
     }
     validate_safe_user_id(user.id).map_err(|_| ApiError::internal("invalid user id"))?;
     Ok(Some(CurrentUser {

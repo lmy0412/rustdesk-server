@@ -12,6 +12,19 @@ allowed_origins = [
     # "https://console.example.com",
 ]
 
+# 首次启动时以这里的值创建数据库策略；之后 Web 控制台通过
+# /api/security/policies 更新的数据库值优先。
+[pro.security]
+password_min_length = 12
+password_require_number = true
+password_require_symbol = true
+login_max_failures = 5
+login_lock_minutes = 15
+session_timeout_minutes = 1440
+# 为空表示不限制管理员直连 IP；服务端不信任 X-Forwarded-For。
+allowed_admin_cidrs = []
+audit_retention_days = 180
+
 # 空数据库首次启动前，请通过进程管理器或 secret manager 注入
 # RUSTDESK_INITIAL_ADMIN_PASSWORD。首次管理员创建成功后立即移除该环境变量。
 #

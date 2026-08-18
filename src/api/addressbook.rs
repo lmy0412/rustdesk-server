@@ -3,6 +3,7 @@ use crate::{
         access::{ApiError, LimitedJson},
         middleware::ApiProtectionState,
     },
+    audit::{AuditEvent, AuditService},
     auth::jwt::CurrentUser,
     database::{AddressBookError, Database},
     models::addressbook::{
@@ -12,6 +13,7 @@ use crate::{
 };
 use axum::{
     extract::{
+        connect_info::ConnectInfo,
         rejection::{PathRejection, QueryRejection},
         Extension, Path, Query,
     },
@@ -22,7 +24,9 @@ use axum::{
 use data_encoding::HEXLOWER;
 use hbb_common::log;
 use serde_derive::{Deserialize, Serialize};
+use serde_json::json;
 use sodiumoxide::crypto::hash::sha256;
+use std::net::{IpAddr, SocketAddr};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -184,6 +188,8 @@ pub async fn handle_share_device(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
     Extension(protection): Extension<ApiProtectionState>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     path: Result<Path<String>, PathRejection>,
     payload: Result<LimitedJson<ShareRequest>, ApiError>,
 ) -> Result<(StatusCode, Json<ShareDto>), ApiError> {
@@ -201,7 +207,14 @@ pub async fn handle_share_device(
             payload.permission,
         )
         .await;
-    audit_result(current.id, "share", &resource_hash, &result);
+    audit_result(
+        &audit,
+        current.id,
+        peer.ip(),
+        "share",
+        &resource_hash,
+        &result,
+    );
     let ShareMutation { created, share } = result.map_err(map_address_book_error)?;
     Ok((
         if created {
@@ -217,6 +230,8 @@ pub async fn handle_cancel_share(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
     Extension(protection): Extension<ApiProtectionState>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     path: Result<Path<String>, PathRejection>,
     query: Result<Query<CancelQuery>, QueryRejection>,
 ) -> Result<StatusCode, ApiError> {
@@ -229,7 +244,14 @@ pub async fn handle_cancel_share(
     let result = db
         .cancel_device_share(current.id, &device_id, &query.to_username)
         .await;
-    audit_result(current.id, "cancel", &resource_hash, &result);
+    audit_result(
+        &audit,
+        current.id,
+        peer.ip(),
+        "cancel",
+        &resource_hash,
+        &result,
+    );
     result.map_err(map_address_book_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -238,6 +260,8 @@ pub async fn handle_accept_share(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
     Extension(protection): Extension<ApiProtectionState>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     path: Result<Path<i64>, PathRejection>,
 ) -> Result<Json<ShareDto>, ApiError> {
     ensure_write_role(&current)?;
@@ -246,7 +270,14 @@ pub async fn handle_accept_share(
     protection.check_address_book_actor(current.id)?;
     let resource_hash = resource_hash(&share_id.to_string());
     let result = db.accept_device_share(current.id, share_id).await;
-    audit_result(current.id, "accept", &resource_hash, &result);
+    audit_result(
+        &audit,
+        current.id,
+        peer.ip(),
+        "accept",
+        &resource_hash,
+        &result,
+    );
     Ok(Json(result.map_err(map_address_book_error)?))
 }
 
@@ -254,6 +285,8 @@ pub async fn handle_reject_share(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
     Extension(protection): Extension<ApiProtectionState>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     path: Result<Path<i64>, PathRejection>,
 ) -> Result<Json<ShareDto>, ApiError> {
     ensure_write_role(&current)?;
@@ -262,7 +295,14 @@ pub async fn handle_reject_share(
     protection.check_address_book_actor(current.id)?;
     let resource_hash = resource_hash(&share_id.to_string());
     let result = db.reject_device_share(current.id, share_id).await;
-    audit_result(current.id, "reject", &resource_hash, &result);
+    audit_result(
+        &audit,
+        current.id,
+        peer.ip(),
+        "reject",
+        &resource_hash,
+        &result,
+    );
     Ok(Json(result.map_err(map_address_book_error)?))
 }
 
@@ -323,7 +363,9 @@ fn resource_hash(resource: &str) -> String {
 }
 
 fn audit_result<T>(
+    audit: &AuditService,
     actor_id: i64,
+    peer_ip: IpAddr,
     action: &'static str,
     resource_hash: &str,
     result: &Result<T, AddressBookError>,
@@ -345,6 +387,13 @@ fn audit_result<T>(
         action,
         result_class,
         resource_hash
+    );
+    audit.record(
+        AuditEvent::new(format!("address_book.{action}"))
+            .actor(actor_id)
+            .target("address_book_share", resource_hash.to_string())
+            .ip(peer_ip)
+            .detail(json!({"result": result_class})),
     );
 }
 

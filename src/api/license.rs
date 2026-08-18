@@ -1,4 +1,5 @@
 use crate::{
+    audit::{resource_fingerprint, AuditEvent, AuditService},
     auth::jwt::CurrentUser,
     database::{Database, InactiveUpdate},
     peer::{
@@ -6,10 +7,15 @@ use crate::{
         InvalidationResult,
     },
 };
-use axum::{extract::Extension, extract::Path, http::StatusCode, Json};
+use axum::{
+    extract::{connect_info::ConnectInfo, Extension, Path},
+    http::StatusCode,
+    Json,
+};
 use once_cell::sync::Lazy;
 use serde_derive::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 use tokio::{
     sync::{mpsc::error::TrySendError, oneshot, Mutex},
     time::{timeout, Duration},
@@ -18,9 +24,19 @@ use tokio::{
 type ApiError = (StatusCode, Json<Value>);
 static LICENSE_UPLOAD_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LicenseUploadRequest {
     pub license_key: String,
+}
+
+impl std::fmt::Debug for LicenseUploadRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LicenseUploadRequest")
+            .field("license_key", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -74,11 +90,25 @@ pub struct DeviceInactiveResponse {
 pub async fn handle_license_upload(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     Json(payload): Json<LicenseUploadRequest>,
 ) -> Result<Json<LicenseUploadResponse>, ApiError> {
     require_admin(&current)?;
-    let license = crate::license::parse_license_key(&payload.license_key)
-        .map_err(|err| bad_request(error_message(err)))?;
+    let fingerprint = resource_fingerprint(&payload.license_key);
+    let license = match crate::license::parse_license_key(&payload.license_key) {
+        Ok(license) => license,
+        Err(err) => {
+            audit.record(
+                AuditEvent::new("license.upload.failure")
+                    .actor(current.id)
+                    .target("license", &fingerprint)
+                    .ip(peer.ip())
+                    .detail(json!({"reason": error_message(err)})),
+            );
+            return Err(bad_request("license validation failed".to_string()));
+        }
+    };
     let _upload_guard = LICENSE_UPLOAD_LOCK.lock().await;
     db.upsert_license(
         &payload.license_key,
@@ -103,11 +133,19 @@ pub async fn handle_license_upload(
     }
 
     let warning = if crate::license::is_license_expired(&license) {
+        audit.record(
+            AuditEvent::new("license.expired")
+                .actor(current.id)
+                .target("license", &fingerprint)
+                .ip(peer.ip())
+                .detail(json!({"source": "upload"})),
+        );
         Some("license has expired".to_string())
     } else {
         None
     };
 
+    audit.record(AuditEvent::new("license.upload.success").actor(current.id).target("license", &fingerprint).ip(peer.ip()).detail(json!({"max_devices": license.max_devices, "max_users": license.max_users, "expires_at": license.expires_at})));
     Ok(Json(LicenseUploadResponse {
         status: "activated".to_string(),
         issued_to: license.issued_to.clone(),
@@ -191,6 +229,8 @@ pub async fn handle_device_inactive(
     Extension(db): Extension<Database>,
     Extension(device_control_tx): Extension<DeviceInvalidationSender>,
     Extension(current): Extension<CurrentUser>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
 ) -> Result<Json<DeviceInactiveResponse>, ApiError> {
     require_admin(&current)?;
     match db
@@ -218,6 +258,13 @@ pub async fn handle_device_inactive(
         Ok(Ok(Ok(result))) => result,
         Ok(Ok(Err(()))) | Ok(Err(_)) | Err(_) => return Err(invalidation_unavailable()),
     };
+    audit.record(
+        AuditEvent::new("device.inactive")
+            .actor(current.id)
+            .target("device", resource_fingerprint(&device_id))
+            .ip(peer.ip())
+            .detail(json!({"invalidation": invalidation_name(invalidation)})),
+    );
     Ok(Json(DeviceInactiveResponse {
         device_id,
         status: "inactive_committed".to_string(),

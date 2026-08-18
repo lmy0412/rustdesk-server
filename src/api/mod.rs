@@ -1,6 +1,7 @@
 pub mod access;
 pub mod addressbook;
 pub mod admin_init;
+pub mod audit;
 pub mod auth;
 pub mod auth_service;
 pub mod client_auth;
@@ -11,20 +12,23 @@ pub mod health;
 pub mod license;
 pub mod middleware;
 pub mod oidc;
+pub mod security;
 pub mod sysinfo;
 pub mod sysinfo_ver;
 pub mod users;
 pub mod version;
 
 #[cfg(test)]
-use crate::config::ApiRateLimitConfig;
+use crate::config::{ApiRateLimitConfig, SecurityConfig};
 #[cfg(test)]
 use crate::peer::DEVICE_INVALIDATION_CHANNEL_CAPACITY;
 use crate::{
+    audit::AuditService,
     auth::AuthState,
     config::{global_config, OidcConfig},
     database::Database,
     peer::DeviceInvalidationSender,
+    security::SecurityPolicyState,
 };
 #[cfg(test)]
 use axum::extract::connect_info::ConnectInfo;
@@ -73,9 +77,33 @@ fn build_router_with_protection(
     device_control_tx: DeviceInvalidationSender,
     protection: middleware::ApiProtectionState,
 ) -> Router {
+    let security_config = global_config()
+        .and_then(|config| config.read().ok().map(|config| config.pro.security.clone()))
+        .unwrap_or_default();
+    let security =
+        SecurityPolicyState::new(security_config).expect("default security policy must be valid");
+    build_router_with_states(
+        db,
+        auth_state,
+        oidc_config,
+        device_control_tx,
+        protection,
+        security,
+    )
+}
+
+fn build_router_with_states(
+    db: Database,
+    auth_state: AuthState,
+    oidc_config: OidcConfig,
+    device_control_tx: DeviceInvalidationSender,
+    protection: middleware::ApiProtectionState,
+    security: SecurityPolicyState,
+) -> Router {
     #[cfg(test)]
     middleware::clear_token_rejection_cache();
     device_deletion::spawn_dispatcher(db.clone(), device_control_tx.clone());
+    let audit = AuditService::start(db.clone(), Some(security.clone()));
 
     let inventory_router = Router::new()
         .route(
@@ -217,6 +245,21 @@ fn build_router_with_protection(
             middleware::protect_shared_endpoint,
         ));
 
+    let audit_security_router = Router::new()
+        .route("/api/audit-logs", get(audit::handle_list_audit_logs))
+        .route(
+            "/api/security/policies",
+            get(security::handle_get_policies).put(security::handle_update_policies),
+        )
+        .layer(axum::middleware::from_fn(middleware::auth_layer))
+        .layer(axum::middleware::from_fn(
+            middleware::protect_shared_endpoint,
+        ))
+        .layer(RequestBodyLimitLayer::new(64 * 1024))
+        .layer(axum::middleware::from_fn(
+            middleware::normalize_api_error_response,
+        ));
+
     let public_utility_router = Router::new()
         .route("/api/auth/oidc/login", get(oidc::handle_oidc_login))
         .route("/api/auth/oidc/callback", get(oidc::handle_oidc_callback))
@@ -235,6 +278,7 @@ fn build_router_with_protection(
         .merge(telemetry_router)
         .merge(sysinfo_version_router)
         .merge(address_book_router)
+        .merge(audit_security_router)
         .merge(protected_router)
         .layer(
             ServiceBuilder::new()
@@ -242,7 +286,9 @@ fn build_router_with_protection(
                 .layer(Extension(device_control_tx))
                 .layer(Extension(auth_state))
                 .layer(Extension(oidc_config.clone()))
-                .layer(Extension(protection)),
+                .layer(Extension(protection))
+                .layer(Extension(security))
+                .layer(Extension(audit)),
         )
         .fallback(any(handle_404))
         .layer(middleware::rate_limit_layer())
@@ -287,7 +333,19 @@ pub fn api_server_forever(
             }
         };
         let protection = new_api_protection_state();
-        if let Err(err) = admin_init::create_initial_admin(&db, &protection).await {
+        let security_config = global_config()
+            .and_then(|config| config.read().ok().map(|config| config.pro.security.clone()))
+            .unwrap_or_default();
+        let security = match SecurityPolicyState::load(&db, &security_config).await {
+            Ok(security) => security,
+            Err(err) => {
+                let message = format!("API server failed to load security policy: {}", err);
+                let _ = ready_tx.send(Err(message.clone()));
+                eprintln!("Fatal: {}", message);
+                std::process::exit(1);
+            }
+        };
+        if let Err(err) = admin_init::create_initial_admin(&db, &protection, &security).await {
             let message = format!("API server failed to initialize admin user: {}", err);
             let _ = ready_tx.send(Err(message.clone()));
             eprintln!("Fatal: {}", message);
@@ -298,12 +356,13 @@ pub fn api_server_forever(
             log::warn!("许可证加载失败，Pro 模式新连接将被拒绝: {}", err);
         }
 
-        let app = build_router_with_protection(
+        let app = build_router_with_states(
             db,
             auth_state,
             oidc_config,
             device_control_tx,
             protection,
+            security,
         );
         log::info!("API server binding to {}", addr);
         match axum::Server::try_bind(&addr) {
@@ -2646,6 +2705,302 @@ mod tests {
         });
     }
 
+    #[test]
+    fn issue11_login_lockout_is_atomic_and_audited() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("api-issue11-lockout");
+            let db = Database::new(&path).await.unwrap();
+            let password_hash = admin_init::hash_password("correct-password").unwrap();
+            db.create_user("locked-user", &password_hash, None, "user")
+                .await
+                .unwrap();
+            let app = build_test_router(db.clone(), test_auth_state(), test_oidc_config());
+
+            for attempt in 1..=5 {
+                let response = app
+                    .clone()
+                    .oneshot(json_request(
+                        "/api/auth/login",
+                        json!({ "username": "locked-user", "password": "wrong-password" }),
+                    ))
+                    .await
+                    .unwrap();
+                if attempt < 5 {
+                    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                } else {
+                    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+                    assert!(response.headers().get(header::RETRY_AFTER).is_some());
+                }
+            }
+
+            let locked = db
+                .find_user_by_username("locked-user")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(locked.failed_login_count, 5);
+            assert!(locked.locked_until.is_some());
+
+            let response = app
+                .clone()
+                .oneshot(json_request(
+                    "/api/auth/login",
+                    json!({ "username": "locked-user", "password": "correct-password" }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+            let mut locked_events = 0;
+            for _ in 0..40 {
+                let (_, total) = db
+                    .list_audit_logs(&crate::audit::AuditLogFilter {
+                        action: Some("auth.login.locked".to_string()),
+                        page: 1,
+                        page_size: 50,
+                        ..crate::audit::AuditLogFilter::default()
+                    })
+                    .await
+                    .unwrap();
+                locked_events = total;
+                if locked_events >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(locked_events >= 2);
+            drop(app);
+            drop(db);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn issue11_security_policy_and_audit_api_work_end_to_end() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("api-issue11-policy-audit");
+            let db = Database::new(&path).await.unwrap();
+            let password_hash = admin_init::hash_password("secret").unwrap();
+            db.create_user("admin", &password_hash, None, "admin")
+                .await
+                .unwrap();
+            db.create_user("ordinary", &password_hash, None, "user")
+                .await
+                .unwrap();
+            let app = build_test_router(db.clone(), test_auth_state(), test_oidc_config());
+            let admin_token = login_access_token(&app, "admin", "secret").await;
+            let ordinary_token = login_access_token(&app, "ordinary", "secret").await;
+
+            let forbidden = app
+                .clone()
+                .oneshot(authenticated_request(
+                    "GET",
+                    "/api/audit-logs",
+                    &ordinary_token,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+            let policy = json!({
+                "password_min_length": 12,
+                "password_require_number": true,
+                "password_require_symbol": true,
+                "login_max_failures": 5,
+                "login_lock_minutes": 15,
+                "session_timeout_minutes": 1,
+                "allowed_admin_cidrs": ["127.0.0.1/32"],
+                "audit_retention_days": 180
+            });
+            let update = app
+                .clone()
+                .oneshot(authenticated_json_request(
+                    "PUT",
+                    "/api/security/policies",
+                    &admin_token,
+                    policy.clone(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(update.status(), StatusCode::OK);
+
+            let get = app
+                .clone()
+                .oneshot(authenticated_request(
+                    "GET",
+                    "/api/security/policies",
+                    &admin_token,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(get.status(), StatusCode::OK);
+            let current: Value = serde_json::from_slice(&read_body(get.into_body()).await).unwrap();
+            assert_eq!(current, policy);
+
+            let refreshed_token = login_access_token(&app, "admin", "secret").await;
+            let claims = crate::auth::jwt::verify_token(&refreshed_token, "test-secret").unwrap();
+            assert!((55..=60).contains(&(claims.exp - claims.iat)));
+
+            let mut excluded_policy = policy.clone();
+            excluded_policy["allowed_admin_cidrs"] = json!(["10.0.0.0/8"]);
+            let self_lockout = app
+                .clone()
+                .oneshot(authenticated_json_request(
+                    "PUT",
+                    "/api/security/policies",
+                    &admin_token,
+                    excluded_policy,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(self_lockout.status(), StatusCode::BAD_REQUEST);
+
+            let weak = app
+                .clone()
+                .oneshot(authenticated_json_request(
+                    "POST",
+                    "/api/users",
+                    &admin_token,
+                    json!({ "username": "weak-user", "password": "weak", "role": "user" }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(weak.status(), StatusCode::BAD_REQUEST);
+
+            let strong_password = "Strong-pass-1";
+            let created = app
+                .clone()
+                .oneshot(authenticated_json_request(
+                    "POST",
+                    "/api/users",
+                    &admin_token,
+                    json!({
+                        "username": "strong-user",
+                        "password": strong_password,
+                        "role": "user"
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(created.status(), StatusCode::CREATED);
+
+            let invalid_license = app
+                .clone()
+                .oneshot(authenticated_json_request(
+                    "POST",
+                    "/api/license/upload",
+                    &admin_token,
+                    json!({ "license_key": "not-a-valid-license" }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(invalid_license.status(), StatusCode::BAD_REQUEST);
+
+            for _ in 0..40 {
+                let (_, users_total) = db
+                    .list_audit_logs(&crate::audit::AuditLogFilter {
+                        action: Some("user.create".to_string()),
+                        page: 1,
+                        page_size: 50,
+                        ..crate::audit::AuditLogFilter::default()
+                    })
+                    .await
+                    .unwrap();
+                let (_, license_total) = db
+                    .list_audit_logs(&crate::audit::AuditLogFilter {
+                        action: Some("license.upload.failure".to_string()),
+                        page: 1,
+                        page_size: 50,
+                        ..crate::audit::AuditLogFilter::default()
+                    })
+                    .await
+                    .unwrap();
+                if users_total > 0 && license_total > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let audit_response = app
+                .clone()
+                .oneshot(authenticated_request(
+                    "GET",
+                    "/api/audit-logs?action=user.create&page_size=50",
+                    &admin_token,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(audit_response.status(), StatusCode::OK);
+            let audit_body = read_body(audit_response.into_body()).await;
+            let audit_json: Value = serde_json::from_slice(&audit_body).unwrap();
+            assert!(audit_json["total"].as_i64().unwrap() >= 1);
+            assert!(!String::from_utf8(audit_body)
+                .unwrap()
+                .contains(strong_password));
+
+            let invalid_page_size = app
+                .clone()
+                .oneshot(authenticated_request(
+                    "GET",
+                    "/api/audit-logs?page_size=201",
+                    &admin_token,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(invalid_page_size.status(), StatusCode::BAD_REQUEST);
+            let (_, license_failures) = db
+                .list_audit_logs(&crate::audit::AuditLogFilter {
+                    action: Some("license.upload.failure".to_string()),
+                    page: 1,
+                    page_size: 50,
+                    ..crate::audit::AuditLogFilter::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(license_failures, 1);
+            drop(app);
+            drop(db);
+            cleanup(&path);
+        });
+    }
+
+    #[test]
+    fn issue11_admin_cidr_policy_rejects_login_from_disallowed_ip() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let path = temp_db_path("api-issue11-admin-cidr");
+            let db = Database::new(&path).await.unwrap();
+            let password_hash = admin_init::hash_password("secret").unwrap();
+            db.create_user("admin", &password_hash, None, "admin")
+                .await
+                .unwrap();
+            let (tx, _rx) = tokio::sync::mpsc::channel(DEVICE_INVALIDATION_CHANNEL_CAPACITY);
+            let security = SecurityPolicyState::new(SecurityConfig {
+                allowed_admin_cidrs: vec!["10.0.0.0/8".to_string()],
+                ..SecurityConfig::default()
+            })
+            .unwrap();
+            let app = build_router_with_states(
+                db,
+                test_auth_state(),
+                test_oidc_config(),
+                tx,
+                middleware::ApiProtectionState::new(ApiRateLimitConfig::default()),
+                security,
+            );
+            let response = app
+                .oneshot(json_request(
+                    "/api/auth/login",
+                    json!({ "username": "admin", "password": "secret" }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            cleanup(&path);
+        });
+    }
+
     fn build_test_router_with_config(
         db: Database,
         auth_state: AuthState,
@@ -2675,6 +3030,21 @@ mod tests {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
         }
         builder.body(body.into()).unwrap()
+    }
+
+    fn authenticated_json_request(
+        method: &str,
+        uri: &str,
+        token: &str,
+        value: Value,
+    ) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(value.to_string()))
+            .unwrap()
     }
 
     fn post_sized_request_with_optional_token(

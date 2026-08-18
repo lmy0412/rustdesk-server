@@ -1,4 +1,8 @@
-use crate::models::user::{validate_username, User};
+use crate::{
+    audit::{AuditEvent, AuditLogFilter, AuditLogRow},
+    config::SecurityConfig,
+    models::user::{validate_username, User},
+};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use hbb_common::{bail, log, ResultType};
@@ -24,7 +28,7 @@ pub use inventory::*;
 
 type Pool = deadpool::managed::Pool<DbPool>;
 static NEXT_DATABASE_SCOPE: AtomicU64 = AtomicU64::new(1);
-const USER_COLUMNS: &str = "id, username, password_hash, email, role, is_active, token_version, oauth_provider, oauth_subject, last_login_at, created_at, updated_at";
+const USER_COLUMNS: &str = "id, username, password_hash, email, role, is_active, token_version, failed_login_count, locked_until, oauth_provider, oauth_subject, last_login_at, created_at, updated_at";
 const DEVICE_COLUMNS: &str = "guid, device_id AS id, uuid, pk, CAST(NULL AS BLOB) AS user, info, status, last_seen, note, owner_user_id, group_id, features, token_version, management_generation";
 
 pub struct DbPool {
@@ -232,6 +236,24 @@ pub struct UpdateUserFields {
     pub is_active: Option<bool>,
     pub password_hash: Option<String>,
     pub increment_token_version: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginFailureState {
+    pub failed_login_count: i64,
+    pub locked_until: Option<NaiveDateTime>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct SecurityPolicyRow {
+    password_min_length: i64,
+    password_require_number: bool,
+    password_require_symbol: bool,
+    login_max_failures: i64,
+    login_lock_minutes: i64,
+    session_timeout_minutes: i64,
+    allowed_admin_cidrs: String,
+    audit_retention_days: i64,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -684,7 +706,7 @@ impl Database {
             "
             INSERT INTO users(username, password_hash, email, role)
             VALUES(?, ?, ?, ?)
-            RETURNING id, username, password_hash, email, role, is_active, token_version, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
+            RETURNING id, username, password_hash, email, role, is_active, token_version, failed_login_count, locked_until, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
             ",
         )
         .bind(username)
@@ -712,7 +734,7 @@ impl Database {
     pub async fn find_user_by_id(&self, id: i64) -> ResultType<Option<User>> {
         Ok(sqlx::query_as::<_, User>(
             "
-            SELECT id, username, password_hash, email, role, is_active, token_version, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
+            SELECT id, username, password_hash, email, role, is_active, token_version, failed_login_count, locked_until, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
             FROM users
             WHERE id = ?
             ",
@@ -725,7 +747,7 @@ impl Database {
     pub async fn find_user_by_username(&self, username: &str) -> ResultType<Option<User>> {
         Ok(sqlx::query_as::<_, User>(
             "
-            SELECT id, username, password_hash, email, role, is_active, token_version, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
+            SELECT id, username, password_hash, email, role, is_active, token_version, failed_login_count, locked_until, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
             FROM users
             WHERE username = ?
             ",
@@ -742,7 +764,7 @@ impl Database {
 
         let users = sqlx::query_as::<_, User>(
             "
-            SELECT id, username, password_hash, email, role, is_active, token_version, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
+            SELECT id, username, password_hash, email, role, is_active, token_version, failed_login_count, locked_until, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
             FROM users
             ORDER BY id
             LIMIT ? OFFSET ?
@@ -791,7 +813,7 @@ impl Database {
             "
             INSERT INTO users(username, password_hash, email, role, oauth_provider, oauth_subject, last_login_at)
             VALUES(?, '', ?, 'user', ?, ?, current_timestamp)
-            RETURNING id, username, password_hash, email, role, is_active, token_version, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
+            RETURNING id, username, password_hash, email, role, is_active, token_version, failed_login_count, locked_until, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
             ",
         )
         .bind(username)
@@ -845,6 +867,66 @@ impl Database {
         self.find_user_by_id(user_id)
             .await?
             .ok_or_else(|| hbb_common::anyhow::anyhow!("user not found"))
+    }
+
+    pub async fn record_login_success(&self, user_id: i64) -> ResultType<User> {
+        let result = sqlx::query(
+            r#"
+            UPDATE users
+            SET failed_login_count = 0,
+                locked_until = NULL,
+                last_login_at = current_timestamp,
+                updated_at = current_timestamp
+            WHERE id = ? AND is_active = 1
+            "#,
+        )
+        .bind(user_id)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        if result.rows_affected() != 1 {
+            bail!("user not found or inactive");
+        }
+        self.find_user_by_id(user_id)
+            .await?
+            .ok_or_else(|| hbb_common::anyhow::anyhow!("user not found"))
+    }
+
+    pub async fn record_login_failure(
+        &self,
+        user_id: i64,
+        max_failures: u32,
+        lock_minutes: u32,
+    ) -> ResultType<LoginFailureState> {
+        let row = sqlx::query(
+            r#"
+            UPDATE users
+            SET failed_login_count = CASE
+                    WHEN locked_until IS NOT NULL AND locked_until <= current_timestamp THEN 1
+                    ELSE failed_login_count + 1
+                END,
+                locked_until = CASE
+                    WHEN (CASE
+                        WHEN locked_until IS NOT NULL AND locked_until <= current_timestamp THEN 1
+                        ELSE failed_login_count + 1
+                    END) >= ?
+                    THEN datetime(current_timestamp, printf('+%d minutes', ?))
+                    ELSE NULL
+                END,
+                updated_at = current_timestamp
+            WHERE id = ?
+            RETURNING failed_login_count, locked_until
+            "#,
+        )
+        .bind(i64::from(max_failures))
+        .bind(i64::from(lock_minutes))
+        .bind(user_id)
+        .fetch_optional(self.pool.get().await?.deref_mut())
+        .await?
+        .ok_or_else(|| hbb_common::anyhow::anyhow!("user not found"))?;
+        Ok(LoginFailureState {
+            failed_login_count: row.try_get("failed_login_count")?,
+            locked_until: row.try_get("locked_until")?,
+        })
     }
 
     pub async fn update_user(&self, id: i64, fields: UpdateUserFields) -> ResultType<User> {
@@ -1036,6 +1118,188 @@ impl Database {
             None => bail!("user not found"),
         }
     }
+
+    pub async fn load_or_create_security_policy(
+        &self,
+        defaults: &SecurityConfig,
+    ) -> ResultType<SecurityConfig> {
+        let cidrs = serde_json::to_string(&defaults.allowed_admin_cidrs)?;
+        let mut connection = self.pool.get().await?;
+        let mut tx = connection.begin().await?;
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO security_policies(
+                id, password_min_length, password_require_number, password_require_symbol,
+                login_max_failures, login_lock_minutes, session_timeout_minutes,
+                allowed_admin_cidrs, audit_retention_days
+            ) VALUES(1, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(i64::try_from(defaults.password_min_length)?)
+        .bind(defaults.password_require_number)
+        .bind(defaults.password_require_symbol)
+        .bind(i64::from(defaults.login_max_failures))
+        .bind(i64::from(defaults.login_lock_minutes))
+        .bind(i64::from(defaults.session_timeout_minutes))
+        .bind(cidrs)
+        .bind(i64::from(defaults.audit_retention_days))
+        .execute(&mut tx)
+        .await?;
+        let row = sqlx::query_as::<_, SecurityPolicyRow>(
+            r#"
+            SELECT password_min_length, password_require_number, password_require_symbol,
+                   login_max_failures, login_lock_minutes, session_timeout_minutes,
+                   allowed_admin_cidrs, audit_retention_days
+            FROM security_policies WHERE id = 1
+            "#,
+        )
+        .fetch_one(&mut tx)
+        .await?;
+        tx.commit().await?;
+        security_config_from_row(row)
+    }
+
+    pub async fn save_security_policy(&self, config: &SecurityConfig) -> ResultType<()> {
+        let cidrs = serde_json::to_string(&config.allowed_admin_cidrs)?;
+        sqlx::query(
+            r#"
+            INSERT INTO security_policies(
+                id, password_min_length, password_require_number, password_require_symbol,
+                login_max_failures, login_lock_minutes, session_timeout_minutes,
+                allowed_admin_cidrs, audit_retention_days, updated_at
+            ) VALUES(1, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+            ON CONFLICT(id) DO UPDATE SET
+                password_min_length = excluded.password_min_length,
+                password_require_number = excluded.password_require_number,
+                password_require_symbol = excluded.password_require_symbol,
+                login_max_failures = excluded.login_max_failures,
+                login_lock_minutes = excluded.login_lock_minutes,
+                session_timeout_minutes = excluded.session_timeout_minutes,
+                allowed_admin_cidrs = excluded.allowed_admin_cidrs,
+                audit_retention_days = excluded.audit_retention_days,
+                updated_at = current_timestamp
+            "#,
+        )
+        .bind(i64::try_from(config.password_min_length)?)
+        .bind(config.password_require_number)
+        .bind(config.password_require_symbol)
+        .bind(i64::from(config.login_max_failures))
+        .bind(i64::from(config.login_lock_minutes))
+        .bind(i64::from(config.session_timeout_minutes))
+        .bind(cidrs)
+        .bind(i64::from(config.audit_retention_days))
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn insert_audit_event(&self, event: &AuditEvent) -> ResultType<()> {
+        let detail = serde_json::to_string(&event.detail)?;
+        sqlx::query(
+            r#"
+            INSERT INTO audit_logs(
+                user_id, action, resource_type, resource_id, detail, ip_address, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(event.user_id)
+        .bind(&event.action)
+        .bind(&event.target_type)
+        .bind(&event.target_id)
+        .bind(detail)
+        .bind(&event.ip_address)
+        .bind(event.occurred_at)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_audit_logs(
+        &self,
+        filter: &AuditLogFilter,
+    ) -> ResultType<(Vec<AuditLogRow>, i64)> {
+        let offset = filter
+            .page
+            .checked_sub(1)
+            .and_then(|page| page.checked_mul(filter.page_size))
+            .ok_or_else(|| hbb_common::anyhow::anyhow!("audit pagination overflow"))?;
+        let mut connection = self.pool.get().await?;
+        let rows = sqlx::query_as::<_, AuditLogRow>(
+            r#"
+            SELECT id, user_id, action, resource_type AS target_type,
+                   resource_id AS target_id, detail, ip_address, created_at
+            FROM audit_logs
+            WHERE (? IS NULL OR action = ?)
+              AND (? IS NULL OR resource_type = ?)
+              AND (? IS NULL OR user_id = ?)
+              AND (? IS NULL OR created_at >= ?)
+              AND (? IS NULL OR created_at <= ?)
+            ORDER BY created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            "#,
+        )
+        .bind(filter.action.as_deref())
+        .bind(filter.action.as_deref())
+        .bind(filter.target_type.as_deref())
+        .bind(filter.target_type.as_deref())
+        .bind(filter.user_id)
+        .bind(filter.user_id)
+        .bind(filter.from)
+        .bind(filter.from)
+        .bind(filter.to)
+        .bind(filter.to)
+        .bind(filter.page_size)
+        .bind(offset)
+        .fetch_all(connection.deref_mut())
+        .await?;
+        let total = sqlx::query(
+            r#"
+            SELECT COUNT(*) AS count
+            FROM audit_logs
+            WHERE (? IS NULL OR action = ?)
+              AND (? IS NULL OR resource_type = ?)
+              AND (? IS NULL OR user_id = ?)
+              AND (? IS NULL OR created_at >= ?)
+              AND (? IS NULL OR created_at <= ?)
+            "#,
+        )
+        .bind(filter.action.as_deref())
+        .bind(filter.action.as_deref())
+        .bind(filter.target_type.as_deref())
+        .bind(filter.target_type.as_deref())
+        .bind(filter.user_id)
+        .bind(filter.user_id)
+        .bind(filter.from)
+        .bind(filter.from)
+        .bind(filter.to)
+        .bind(filter.to)
+        .fetch_one(connection.deref_mut())
+        .await?
+        .try_get::<i64, _>("count")?;
+        Ok((rows, total))
+    }
+
+    pub async fn delete_expired_audit_logs(&self, retention_days: u32) -> ResultType<u64> {
+        let modifier = format!("-{} days", retention_days);
+        let result = sqlx::query("DELETE FROM audit_logs WHERE created_at < datetime('now', ?)")
+            .bind(modifier)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+fn security_config_from_row(row: SecurityPolicyRow) -> ResultType<SecurityConfig> {
+    Ok(SecurityConfig {
+        password_min_length: usize::try_from(row.password_min_length)?,
+        password_require_number: row.password_require_number,
+        password_require_symbol: row.password_require_symbol,
+        login_max_failures: u32::try_from(row.login_max_failures)?,
+        login_lock_minutes: u32::try_from(row.login_lock_minutes)?,
+        session_timeout_minutes: u32::try_from(row.session_timeout_minutes)?,
+        allowed_admin_cidrs: serde_json::from_str(&row.allowed_admin_cidrs)?,
+        audit_retention_days: u32::try_from(row.audit_retention_days)?,
+    })
 }
 
 async fn lock_device_quota(tx: &mut Transaction<'_, Sqlite>) -> ResultType<()> {
@@ -1188,6 +1452,7 @@ mod tests {
                 "groups",
                 "licenses",
                 "audit_logs",
+                "security_policies",
                 "_sqlx_migrations",
             ] {
                 assert!(
@@ -1199,7 +1464,13 @@ mod tests {
                 column_exists(&db, "users", "token_version").await.unwrap(),
                 "users.token_version should exist"
             );
-            for column in ["oauth_provider", "oauth_subject", "last_login_at"] {
+            for column in [
+                "oauth_provider",
+                "oauth_subject",
+                "last_login_at",
+                "failed_login_count",
+                "locked_until",
+            ] {
                 assert!(
                     column_exists(&db, "users", column).await.unwrap(),
                     "users.{column} should exist"
@@ -1207,6 +1478,10 @@ mod tests {
             }
             assert!(index_exists(&db, "idx_users_oauth").await.unwrap());
             assert!(index_exists(&db, "idx_users_last_login_at").await.unwrap());
+            assert!(index_exists(&db, "idx_users_locked_until").await.unwrap());
+            assert!(index_exists(&db, "idx_audit_logs_resource_created_at")
+                .await
+                .unwrap());
             assert!(index_exists(&db, "idx_devices_status_last_seen")
                 .await
                 .unwrap());
