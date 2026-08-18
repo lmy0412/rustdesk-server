@@ -1,11 +1,13 @@
 use crate::{
     api::access::ApiError,
+    audit::{AuditEvent, AuditService},
     auth::{
         jwt::{verify_token, AuthState, CurrentUser, JwtError},
         ACCESS_TOKEN_COOKIE,
     },
     config::{ApiRateLimitConfig, OidcConfig},
     database::Database,
+    security::SecurityPolicyState,
 };
 use axum::{
     extract::{connect_info::ConnectInfo, MatchedPath},
@@ -430,6 +432,16 @@ pub async fn auth_layer<B>(
                 Json(json!({ "error": "auth_state not available" })),
             )
         })?;
+    let security = request
+        .extensions()
+        .get::<SecurityPolicyState>()
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "security policy not available" })),
+            )
+        })?;
     let oidc_config = request
         .extensions()
         .get::<OidcConfig>()
@@ -441,6 +453,20 @@ pub async fn auth_layer<B>(
         validate_cookie_request_origin(&request, &oidc_config)?;
     }
     let claims = verify_token(&token, &auth_state.jwt_secret).map_err(jwt_error_response)?;
+    let issued_at = i64::try_from(claims.iat).map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid token" })),
+        )
+    })?;
+    security
+        .validate_session_issued_at(issued_at)
+        .map_err(|_| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "session expired" })),
+            )
+        })?;
     let cache_scope = token_cache_scope(&auth_state.jwt_secret, db.auth_cache_scope());
 
     if is_token_cached_rejected(cache_scope, claims.sub, claims.token_ver) {
@@ -475,6 +501,40 @@ pub async fn auth_layer<B>(
             ));
         }
     };
+
+    if user.role == "admin" {
+        let peer = request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|peer| peer.0.ip())
+            .ok_or_else(|| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "peer address unavailable; request rejected" })),
+                )
+            })?;
+        let allowed = security.admin_ip_allowed(peer).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "administrator IP policy check failed" })),
+            )
+        })?;
+        if !allowed {
+            if let Some(audit) = request.extensions().get::<AuditService>() {
+                audit.record(
+                    AuditEvent::new("auth.session.ip_denied")
+                        .actor(user.id)
+                        .target("user", user.id.to_string())
+                        .ip(peer)
+                        .detail(json!({"reason": "admin_ip_not_allowed"})),
+                );
+            }
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "administrator IP is not allowed" })),
+            ));
+        }
+    }
 
     request.extensions_mut().insert(CurrentUser {
         id: user.id,

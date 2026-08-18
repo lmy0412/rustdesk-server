@@ -2,6 +2,7 @@ use crate::{
     api::middleware::ApiProtectionState,
     database::Database,
     models::user::{validate_plain_password, AdminInitInfo},
+    security::SecurityPolicyState,
 };
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
@@ -14,6 +15,7 @@ pub const INITIAL_ADMIN_PASSWORD_ENV: &str = "RUSTDESK_INITIAL_ADMIN_PASSWORD";
 pub async fn create_initial_admin(
     db: &Database,
     protection: &ApiProtectionState,
+    security: &SecurityPolicyState,
 ) -> ResultType<Option<AdminInitInfo>> {
     if db.count_users().await? > 0 {
         return Ok(None);
@@ -27,6 +29,11 @@ pub async fn create_initial_admin(
     validate_plain_password(&password).map_err(|message| {
         hbb_common::anyhow::anyhow!(
             "{INITIAL_ADMIN_PASSWORD_ENV} is invalid: {message}; the value was not logged"
+        )
+    })?;
+    security.validate_new_password(&password).map_err(|message| {
+        hbb_common::anyhow::anyhow!(
+            "{INITIAL_ADMIN_PASSWORD_ENV} does not satisfy the security policy: {message}; the value was not logged"
         )
     })?;
     let password_hash = hash_password_bounded(protection, &password).await?;
@@ -74,7 +81,7 @@ pub fn hash_password(password: &str) -> ResultType<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ApiRateLimitConfig;
+    use crate::config::{ApiRateLimitConfig, SecurityConfig};
     use std::{
         sync::{Arc, Mutex},
         time::{SystemTime, UNIX_EPOCH},
@@ -109,22 +116,27 @@ mod tests {
                 .to_string_lossy()
                 .into_owned();
             let protection = ApiProtectionState::new(ApiRateLimitConfig::default());
+            let security = SecurityPolicyState::new(SecurityConfig::default()).unwrap();
 
             std::env::remove_var(INITIAL_ADMIN_PASSWORD_ENV);
             let db = Database::new(&path).await.unwrap();
-            let missing = create_initial_admin(&db, &protection).await.unwrap_err();
+            let missing = create_initial_admin(&db, &protection, &security)
+                .await
+                .unwrap_err();
             assert_eq!(db.count_users().await.unwrap(), 0);
             assert!(!missing.to_string().contains("password-value"));
 
             let invalid_secret = "invalid-secret".repeat(100);
             std::env::set_var(INITIAL_ADMIN_PASSWORD_ENV, &invalid_secret);
-            let invalid = create_initial_admin(&db, &protection).await.unwrap_err();
+            let invalid = create_initial_admin(&db, &protection, &security)
+                .await
+                .unwrap_err();
             assert_eq!(db.count_users().await.unwrap(), 0);
             assert!(!invalid.to_string().contains(&invalid_secret));
 
-            let valid_secret = "sentinel-admin-password";
+            let valid_secret = "sentinel-admin-password-1!";
             std::env::set_var(INITIAL_ADMIN_PASSWORD_ENV, valid_secret);
-            let created = create_initial_admin(&db, &protection)
+            let created = create_initial_admin(&db, &protection, &security)
                 .await
                 .unwrap()
                 .unwrap();
@@ -158,24 +170,26 @@ mod tests {
             let second_db = Database::new(&path).await.unwrap();
             let first_protection = ApiProtectionState::new(ApiRateLimitConfig::default());
             let second_protection = ApiProtectionState::new(ApiRateLimitConfig::default());
+            let first_security = SecurityPolicyState::new(SecurityConfig::default()).unwrap();
+            let second_security = SecurityPolicyState::new(SecurityConfig::default()).unwrap();
             let barrier = Arc::new(Barrier::new(3));
 
             std::env::set_var(
                 INITIAL_ADMIN_PASSWORD_ENV,
-                "concurrent-sentinel-admin-password",
+                "concurrent-sentinel-admin-password-1!",
             );
             let first = {
                 let barrier = barrier.clone();
                 tokio::spawn(async move {
                     barrier.wait().await;
-                    create_initial_admin(&first_db, &first_protection).await
+                    create_initial_admin(&first_db, &first_protection, &first_security).await
                 })
             };
             let second = {
                 let barrier = barrier.clone();
                 tokio::spawn(async move {
                     barrier.wait().await;
-                    create_initial_admin(&second_db, &second_protection).await
+                    create_initial_admin(&second_db, &second_protection, &second_security).await
                 })
             };
             barrier.wait().await;

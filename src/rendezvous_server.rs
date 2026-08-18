@@ -1,3 +1,4 @@
+use crate::audit::{resource_fingerprint, AuditEvent, AuditService};
 use crate::common::*;
 use crate::database::{DeviceAdmissionFailure, DeviceAdmissionResult};
 use crate::license::{self, LicenseError};
@@ -104,6 +105,7 @@ pub struct RendezvousServer {
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
     pending_registrations: Arc<Mutex<PendingRegistrationLimiter>>,
+    audit: AuditService,
 }
 
 enum LoopFailure {
@@ -127,6 +129,7 @@ impl RendezvousServer {
         let nat_port = port - 1;
         let ws_port = port + 2;
         let pm = PeerMap::new().await?;
+        let audit = AuditService::start(pm.db.clone(), None);
         let startup_offline = pm.db.mark_startup_online_offline().await?;
         if startup_offline > 0 {
             log::info!(
@@ -174,6 +177,7 @@ impl RendezvousServer {
                 pro_enabled,
             }),
             pending_registrations: Arc::new(Mutex::new(PendingRegistrationLimiter::default())),
+            audit,
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
@@ -625,6 +629,21 @@ impl RendezvousServer {
                 RegistrationResult::UuidMismatch
             }
             DeviceAdmissionResult::Rejected(DeviceAdmissionFailure::LicenseMismatch) => {
+                let action = if license::current_license()
+                    .as_ref()
+                    .is_some_and(license::is_license_expired)
+                {
+                    "license.expired"
+                } else {
+                    "license.validation.failure"
+                };
+                self.audit.record_rate_limited(
+                    AuditEvent::new(action)
+                        .target("device", resource_fingerprint(&id))
+                        .ip(addr.ip())
+                        .detail(serde_json::json!({"reason": "license_mismatch_or_expired"})),
+                    Duration::from_secs(60),
+                );
                 RegistrationResult::LicenseMismatch
             }
             DeviceAdmissionResult::Rejected(DeviceAdmissionFailure::LicenseOveruse {
@@ -632,6 +651,13 @@ impl RendezvousServer {
                 max,
             }) => {
                 license::log_overuse_limited(&id, current, max);
+                self.audit.record_rate_limited(
+                    AuditEvent::new("license.quota_exceeded")
+                        .target("device", resource_fingerprint(&id))
+                        .ip(addr.ip())
+                        .detail(serde_json::json!({"current": current, "max": max})),
+                    Duration::from_secs(60),
+                );
                 RegistrationResult::LicenseOveruse { current, max }
             }
             DeviceAdmissionResult::Admitted(admission) => {
@@ -1857,6 +1883,7 @@ mod tests {
 
     fn test_server(db: Database, pro_enabled: bool) -> RendezvousServer {
         let (tx, _rx) = mpsc::unbounded_channel();
+        let audit = AuditService::start(db.clone(), None);
         RendezvousServer {
             tcp_punch: Default::default(),
             pm: PeerMap::from_database(db),
@@ -1874,6 +1901,7 @@ mod tests {
                 pro_enabled,
             }),
             pending_registrations: Default::default(),
+            audit,
         }
     }
 

@@ -3,6 +3,7 @@ use crate::{
         create_owner, inventory_error, read_access, validation_error, write_access, ApiError,
         LimitedJson,
     },
+    audit::{resource_fingerprint, AuditEvent, AuditService},
     auth::jwt::CurrentUser,
     database::{Database, ForceDeleteOutcome, GroupDeleteOutcome, GroupRecord, GroupUpdate},
     models::{
@@ -15,15 +16,17 @@ use crate::{
     },
 };
 use axum::{
-    extract::{Extension, Path, Query},
+    extract::{connect_info::ConnectInfo, Extension, Path, Query},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
 use serde_derive::Deserialize;
+use serde_json::json;
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
+    net::SocketAddr,
 };
 
 #[derive(Debug, Deserialize)]
@@ -36,6 +39,8 @@ pub struct DeleteGroupQuery {
 pub async fn handle_create_group(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     LimitedJson(payload): LimitedJson<CreateGroupRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let payload = payload.validate().map_err(validation_error)?;
@@ -50,6 +55,7 @@ pub async fn handle_create_group(
         )
         .await
         .map_err(|error| inventory_error(error, "create group failed"))?;
+    audit.record(AuditEvent::new("group.create").actor(current.id).target("group", group.id.to_string()).ip(peer.ip()).detail(json!({"parent_group_id": group.parent_group_id, "owner_user_id": group.owner_user_id})));
     Ok((StatusCode::CREATED, Json(group_node(group))))
 }
 
@@ -87,6 +93,8 @@ pub async fn handle_get_group(
 pub async fn handle_update_group(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     Path(id): Path<i64>,
     LimitedJson(payload): LimitedJson<UpdateGroupRequest>,
 ) -> Result<Json<GroupTreeNode>, ApiError> {
@@ -105,6 +113,13 @@ pub async fn handle_update_group(
         .await
         .map_err(|error| inventory_error(error, "update group failed"))?
         .ok_or_else(|| ApiError::not_found("group"))?;
+    audit.record(
+        AuditEvent::new("group.update")
+            .actor(current.id)
+            .target("group", id.to_string())
+            .ip(peer.ip())
+            .detail(json!({})),
+    );
     let mut roots = build_group_forest(groups, Some(id))?;
     roots
         .pop()
@@ -115,6 +130,8 @@ pub async fn handle_update_group(
 pub async fn handle_delete_group(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     Path(id): Path<i64>,
     Query(query): Query<DeleteGroupQuery>,
 ) -> Result<Response, ApiError> {
@@ -129,6 +146,7 @@ pub async fn handle_delete_group(
             .await
             .map_err(|error| inventory_error(error, "force delete group failed"))?
             .ok_or_else(|| ApiError::not_found("group"))?;
+        audit.record(AuditEvent::new("group.delete").actor(current.id).target("group", id.to_string()).ip(peer.ip()).detail(json!({"force": true, "deleted_groups": deleted_groups, "ungrouped_devices": ungrouped_devices})));
         return Ok(Json(ForceDeleteGroupResponse {
             deleted_groups,
             ungrouped_devices,
@@ -141,7 +159,16 @@ pub async fn handle_delete_group(
         .await
         .map_err(|error| inventory_error(error, "delete group failed"))?
     {
-        GroupDeleteOutcome::Deleted => Ok(StatusCode::NO_CONTENT.into_response()),
+        GroupDeleteOutcome::Deleted => {
+            audit.record(
+                AuditEvent::new("group.delete")
+                    .actor(current.id)
+                    .target("group", id.to_string())
+                    .ip(peer.ip())
+                    .detail(json!({"force": false})),
+            );
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
         GroupDeleteOutcome::NotFound => Err(ApiError::not_found("group")),
         GroupDeleteOutcome::NotEmpty => {
             Err(ApiError::conflict("group must be empty before deletion"))
@@ -152,6 +179,8 @@ pub async fn handle_delete_group(
 pub async fn handle_add_group_devices(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     Path(id): Path<i64>,
     LimitedJson(payload): LimitedJson<DeviceBatchRequest>,
 ) -> Result<Json<GroupBatchResponse>, ApiError> {
@@ -162,6 +191,7 @@ pub async fn handle_add_group_devices(
         .add_devices_to_group(scope, id, &device_ids)
         .await
         .map_err(|error| inventory_error(error, "add devices to group failed"))?;
+    audit.record(AuditEvent::new("device.group.add").actor(current.id).target("group", id.to_string()).ip(peer.ip()).detail(json!({"device_batch": resource_fingerprint(&device_ids.join("\n")), "matched": outcome.matched, "changed": outcome.changed})));
     Ok(Json(GroupBatchResponse {
         matched_devices: outcome.matched,
         changed_devices: outcome.changed,
@@ -171,6 +201,8 @@ pub async fn handle_add_group_devices(
 pub async fn handle_remove_group_devices(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     Path(id): Path<i64>,
     LimitedJson(payload): LimitedJson<DeviceBatchRequest>,
 ) -> Result<Json<GroupBatchResponse>, ApiError> {
@@ -181,6 +213,7 @@ pub async fn handle_remove_group_devices(
         .remove_devices_from_group(scope, id, &device_ids)
         .await
         .map_err(|error| inventory_error(error, "remove devices from group failed"))?;
+    audit.record(AuditEvent::new("device.group.remove").actor(current.id).target("group", id.to_string()).ip(peer.ip()).detail(json!({"device_batch": resource_fingerprint(&device_ids.join("\n")), "matched": outcome.matched, "changed": outcome.changed})));
     Ok(Json(GroupBatchResponse {
         matched_devices: outcome.matched,
         changed_devices: outcome.changed,

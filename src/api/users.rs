@@ -4,19 +4,23 @@ use crate::{
         auth_service::hash_plain_password,
         middleware::{invalidate_token_cache, ApiProtectionState},
     },
+    audit::{AuditEvent, AuditService},
     auth::jwt::CurrentUser,
     database::{Database, UpdateUserFields},
     models::user::{
         validate_safe_user_id, validate_username, CreateUserRequest, UpdateUserRequest,
         UserSummary, MAX_SAFE_INTEGER,
     },
+    security::SecurityPolicyState,
 };
 use axum::{
-    extract::{Extension, Path, Query},
+    extract::{connect_info::ConnectInfo, Extension, Path, Query},
     http::StatusCode,
     Json,
 };
 use serde_derive::{Deserialize, Serialize};
+use serde_json::json;
+use std::net::SocketAddr;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,6 +77,9 @@ pub async fn handle_create_user(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
     Extension(protection): Extension<ApiProtectionState>,
+    Extension(security): Extension<SecurityPolicyState>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     Json(payload): Json<CreateUserRequest>,
 ) -> Result<(StatusCode, Json<UserSummary>), ApiError> {
     require_admin(&current)?;
@@ -91,7 +98,7 @@ pub async fn handle_create_user(
         ));
     }
 
-    let password_hash = hash_plain_password(&protection, &payload.password).await?;
+    let password_hash = hash_plain_password(&protection, &security, &payload.password).await?;
     let user = db
         .create_user(
             &payload.username,
@@ -102,6 +109,13 @@ pub async fn handle_create_user(
         .await
         .map_err(|_| ApiError::internal("create user failed"))?;
     validate_safe_user_id(user.id).map_err(|_| ApiError::internal("invalid user id"))?;
+    audit.record(
+        AuditEvent::new("user.create")
+            .actor(current.id)
+            .target("user", user.id.to_string())
+            .ip(peer.ip())
+            .detail(json!({"role": user.role})),
+    );
 
     Ok((StatusCode::CREATED, Json(UserSummary::from(user))))
 }
@@ -121,10 +135,14 @@ pub async fn handle_get_user(
     Ok(Json(UserSummary::from(user)))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_update_user(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
     Extension(protection): Extension<ApiProtectionState>,
+    Extension(security): Extension<SecurityPolicyState>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateUserRequest>,
 ) -> Result<Json<UserSummary>, ApiError> {
@@ -138,8 +156,13 @@ pub async fn handle_update_user(
         validate_role(role)?;
     }
 
+    let password_changed = payload.password.is_some();
+    let role_changed = payload.role.is_some();
+    let email_changed = payload.email.is_some();
+    let active_changed = payload.is_active.is_some();
+    let force_logout = payload.force_logout.unwrap_or(false);
     let password_hash = match payload.password.as_ref() {
-        Some(password) => Some(hash_plain_password(&protection, password).await?),
+        Some(password) => Some(hash_plain_password(&protection, &security, password).await?),
         None => None,
     };
     let should_increment_token_version = password_hash.is_some()
@@ -173,12 +196,65 @@ pub async fn handle_update_user(
         invalidate_token_cache(id);
     }
 
+    let mut changed = Vec::new();
+    if email_changed {
+        changed.push("email");
+    }
+    if role_changed {
+        changed.push("role");
+    }
+    if active_changed {
+        changed.push("is_active");
+    }
+    if password_changed {
+        changed.push("password");
+    }
+    if force_logout {
+        changed.push("force_logout");
+    }
+    audit.record(
+        AuditEvent::new("user.update")
+            .actor(current.id)
+            .target("user", id.to_string())
+            .ip(peer.ip())
+            .detail(json!({"changed_fields": changed})),
+    );
+    if role_changed {
+        audit.record(
+            AuditEvent::new("user.role_change")
+                .actor(current.id)
+                .target("user", id.to_string())
+                .ip(peer.ip())
+                .detail(json!({"role": user.role})),
+        );
+    }
+    if password_changed {
+        audit.record(
+            AuditEvent::new("user.password.change")
+                .actor(current.id)
+                .target("user", id.to_string())
+                .ip(peer.ip())
+                .detail(json!({})),
+        );
+    }
+    if force_logout {
+        audit.record(
+            AuditEvent::new("user.force_logout")
+                .actor(current.id)
+                .target("user", id.to_string())
+                .ip(peer.ip())
+                .detail(json!({})),
+        );
+    }
+
     Ok(Json(UserSummary::from(user)))
 }
 
 pub async fn handle_delete_user(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&current)?;
@@ -190,6 +266,13 @@ pub async fn handle_delete_user(
         .await
         .map_err(|_| ApiError::internal("delete user failed"))?;
     invalidate_token_cache(id);
+    audit.record(
+        AuditEvent::new("user.delete")
+            .actor(current.id)
+            .target("user", id.to_string())
+            .ip(peer.ip())
+            .detail(json!({"soft_delete": true})),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -18,6 +18,10 @@ pub struct User {
     #[serde(skip_serializing)]
     pub token_version: i64,
     #[serde(skip_serializing)]
+    pub failed_login_count: i64,
+    #[serde(skip_serializing)]
+    pub locked_until: Option<NaiveDateTime>,
+    #[serde(skip_serializing)]
     pub oauth_provider: Option<String>,
     #[serde(skip_serializing)]
     pub oauth_subject: Option<String>,
@@ -69,6 +73,8 @@ impl fmt::Debug for User {
             .field("role", &self.role)
             .field("is_active", &self.is_active)
             .field("token_version", &self.token_version)
+            .field("failed_login_count", &self.failed_login_count)
+            .field("locked_until", &self.locked_until)
             .field("oauth_provider", &self.oauth_provider)
             .field("oauth_subject", &self.oauth_subject)
             .field("last_login_at", &self.last_login_at)

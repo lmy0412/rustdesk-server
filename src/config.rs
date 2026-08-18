@@ -34,6 +34,21 @@ fn default_jwt_expiry_hours() -> i64 {
 fn default_refresh_expiry_days() -> i64 {
     7
 }
+fn default_password_min_length() -> usize {
+    12
+}
+fn default_login_max_failures() -> u32 {
+    5
+}
+fn default_login_lock_minutes() -> u32 {
+    15
+}
+fn default_session_timeout_minutes() -> u32 {
+    1440
+}
+fn default_audit_retention_days() -> u32 {
+    180
+}
 fn default_key_file() -> String {
     "/var/lib/rustdesk/id_ed25519".to_string()
 }
@@ -206,6 +221,46 @@ impl OidcConfig {
     }
 }
 
+/// 企业安全策略。配置文件提供初始值，Web API 更新后由数据库值覆盖。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    #[serde(default = "default_password_min_length")]
+    pub password_min_length: usize,
+    #[serde(default = "default_true")]
+    pub password_require_number: bool,
+    #[serde(default = "default_true")]
+    pub password_require_symbol: bool,
+    #[serde(default = "default_login_max_failures")]
+    pub login_max_failures: u32,
+    #[serde(default = "default_login_lock_minutes")]
+    pub login_lock_minutes: u32,
+    #[serde(default = "default_session_timeout_minutes")]
+    pub session_timeout_minutes: u32,
+    #[serde(default)]
+    pub allowed_admin_cidrs: Vec<String>,
+    #[serde(default = "default_audit_retention_days")]
+    pub audit_retention_days: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            password_min_length: default_password_min_length(),
+            password_require_number: true,
+            password_require_symbol: true,
+            login_max_failures: default_login_max_failures(),
+            login_lock_minutes: default_login_lock_minutes(),
+            session_timeout_minutes: default_session_timeout_minutes(),
+            allowed_admin_cidrs: Vec::new(),
+            audit_retention_days: default_audit_retention_days(),
+        }
+    }
+}
+
 /// Pro feature configuration
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProConfig {
@@ -228,6 +283,8 @@ pub struct ProConfig {
     pub oidc: OidcConfig,
     #[serde(default)]
     pub smtp: SmtpConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 fn default_web_port() -> u16 {
@@ -252,6 +309,7 @@ impl Default for ProConfig {
             refresh_expiry_days: default_refresh_expiry_days(),
             oidc: OidcConfig::default(),
             smtp: SmtpConfig::default(),
+            security: SecurityConfig::default(),
         }
     }
 }
@@ -563,7 +621,7 @@ impl fmt::Display for ProConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ProConfig {{ enabled: {}, web_port: {}, tls_cert: {}, tls_key: {}, jwt_secret: {}, jwt_expiry_hours: {}, refresh_expiry_days: {}, oidc: {}, smtp: {} }}",
+            "ProConfig {{ enabled: {}, web_port: {}, tls_cert: {}, tls_key: {}, jwt_secret: {}, jwt_expiry_hours: {}, refresh_expiry_days: {}, oidc: {}, smtp: {}, security: {} }}",
             self.enabled,
             self.web_port,
             self.tls_cert,
@@ -572,7 +630,25 @@ impl fmt::Display for ProConfig {
             self.jwt_expiry_hours,
             self.refresh_expiry_days,
             self.oidc,
-            self.smtp
+            self.smtp,
+            self.security
+        )
+    }
+}
+
+impl fmt::Display for SecurityConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SecurityConfig {{ password_min_length: {}, password_require_number: {}, password_require_symbol: {}, login_max_failures: {}, login_lock_minutes: {}, session_timeout_minutes: {}, allowed_admin_cidrs: {:?}, audit_retention_days: {} }}",
+            self.password_min_length,
+            self.password_require_number,
+            self.password_require_symbol,
+            self.login_max_failures,
+            self.login_lock_minutes,
+            self.session_timeout_minutes,
+            self.allowed_admin_cidrs,
+            self.audit_retention_days,
         )
     }
 }
@@ -1186,7 +1262,41 @@ fn validate_config(cfg: &AppConfig) -> Result<(), String> {
         return Err("pro.refresh_expiry_days must be positive".to_string());
     }
     validate_allowed_origins(&cfg.pro.oidc.allowed_origins)?;
+    validate_security_config(&cfg.pro.security)?;
     validate_api_rate_limit(&cfg.api_rate_limit)?;
+    Ok(())
+}
+
+pub fn validate_security_config(cfg: &SecurityConfig) -> Result<(), String> {
+    if !(1..=1024).contains(&cfg.password_min_length) {
+        return Err("pro.security.password_min_length must be within 1..=1024".to_string());
+    }
+    if !(1..=100).contains(&cfg.login_max_failures) {
+        return Err("pro.security.login_max_failures must be within 1..=100".to_string());
+    }
+    if !(1..=10_080).contains(&cfg.login_lock_minutes) {
+        return Err("pro.security.login_lock_minutes must be within 1..=10080".to_string());
+    }
+    if !(1..=525_600).contains(&cfg.session_timeout_minutes) {
+        return Err("pro.security.session_timeout_minutes must be within 1..=525600".to_string());
+    }
+    if !(1..=3650).contains(&cfg.audit_retention_days) {
+        return Err("pro.security.audit_retention_days must be within 1..=3650".to_string());
+    }
+    if cfg.allowed_admin_cidrs.len() > 256 {
+        return Err(
+            "pro.security.allowed_admin_cidrs must contain at most 256 entries".to_string(),
+        );
+    }
+    for cidr in &cfg.allowed_admin_cidrs {
+        let value = cidr.trim();
+        if value.is_empty() || value != cidr {
+            return Err("pro.security.allowed_admin_cidrs contains an invalid CIDR".to_string());
+        }
+        value
+            .parse::<ipnetwork::IpNetwork>()
+            .map_err(|_| "pro.security.allowed_admin_cidrs contains an invalid CIDR".to_string())?;
+    }
     Ok(())
 }
 
@@ -1490,6 +1600,12 @@ fn diff_fields(old: &AppConfig, new: &AppConfig) -> Vec<String> {
     push_diff(&mut fields, "pro.smtp", &old.pro.smtp, &new.pro.smtp);
     push_diff(
         &mut fields,
+        "pro.security",
+        &old.pro.security,
+        &new.pro.security,
+    );
+    push_diff(
+        &mut fields,
         "api_rate_limit",
         &old.api_rate_limit,
         &new.api_rate_limit,
@@ -1536,6 +1652,7 @@ mod tests {
         assert_eq!(cfg.pro.jwt_expiry_hours, 24);
         assert_eq!(cfg.pro.refresh_expiry_days, 7);
         assert!(!cfg.pro.jwt_secret.is_empty());
+        assert_eq!(cfg.pro.security, SecurityConfig::default());
     }
 
     #[test]

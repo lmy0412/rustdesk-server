@@ -1,5 +1,6 @@
 use crate::{
     api::access::{inventory_error, validation_error, write_access, ApiError},
+    audit::{resource_fingerprint, AuditEvent, AuditService},
     auth::jwt::CurrentUser,
     database::{
         Database, DeletionReceipt, DeletionReceiptState, DeviceDeleteOutcome, InventoryError,
@@ -11,12 +12,13 @@ use crate::{
     },
 };
 use axum::{
-    extract::{Extension, Path},
+    extract::{connect_info::ConnectInfo, Extension, Path},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use hbb_common::log;
 use serde_json::json;
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::{
     sync::{mpsc::error::TrySendError, oneshot},
@@ -71,6 +73,8 @@ pub async fn handle_delete_device(
     Extension(db): Extension<Database>,
     Extension(sender): Extension<DeviceInvalidationSender>,
     Extension(current): Extension<CurrentUser>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let access = write_access(&current)?;
@@ -89,8 +93,24 @@ pub async fn handle_delete_device(
         .await
         .map_err(delete_database_error)?;
     match outcome {
-        DeviceDeleteOutcome::Completed => Ok(StatusCode::NO_CONTENT.into_response()),
+        DeviceDeleteOutcome::Completed => {
+            audit.record(
+                AuditEvent::new("device.delete")
+                    .actor(current.id)
+                    .target("device", resource_fingerprint(&device_id))
+                    .ip(peer.ip())
+                    .detail(json!({"state": "completed"})),
+            );
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
         DeviceDeleteOutcome::Pending(receipt) | DeviceDeleteOutcome::DeletedAndPending(receipt) => {
+            audit.record(
+                AuditEvent::new("device.delete")
+                    .actor(current.id)
+                    .target("device", resource_fingerprint(&device_id))
+                    .ip(peer.ip())
+                    .detail(json!({"state": "database_committed_invalidation_pending"})),
+            );
             finish_pending_delete(&db, &sender, receipt).await
         }
         DeviceDeleteOutcome::ScopedMiss => Err(ApiError::not_found("device")),

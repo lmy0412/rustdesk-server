@@ -6,6 +6,7 @@ use crate::{
         },
         middleware::{validate_cookie_request_origin_headers, ApiProtectionState},
     },
+    audit::{AuditEvent, AuditService},
     auth::{
         access_token_cookie, clear_access_token_cookie, clear_refresh_token_cookie,
         jwt::{sign_refresh_token, verify_refresh_token, AuthState, CurrentUser},
@@ -14,32 +15,42 @@ use crate::{
     config::OidcConfig,
     database::Database,
     models::user::{LoginRequest, LoginResponse, RefreshRequest, RefreshResponse},
+    security::SecurityPolicyState,
 };
 use axum::{
     body::Bytes,
-    extract::Extension,
+    extract::{connect_info::ConnectInfo, Extension},
     http::{header, HeaderMap, StatusCode},
     Json,
 };
 use axum_extra::extract::cookie::CookieJar;
+use serde_json::json;
+use std::net::SocketAddr;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_login(
     Extension(db): Extension<Database>,
     Extension(auth_state): Extension<AuthState>,
     Extension(oidc_config): Extension<OidcConfig>,
     Extension(protection): Extension<ApiProtectionState>,
+    Extension(security): Extension<SecurityPolicyState>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     jar: CookieJar,
     Json(payload): Json<LoginRequest>,
 ) -> Result<(CookieJar, Json<LoginResponse>), ApiError> {
     let user = verify_password_and_load_active_user(
         &db,
         &protection,
+        &security,
+        &audit,
+        peer.ip(),
         &payload.username,
         &payload.password,
     )
     .await?;
 
-    let access_token = sign_access_token(&user, &auth_state)?;
+    let (access_token, access_lifetime) = sign_access_token(&user, &auth_state, &security)?;
     let refresh_token = sign_refresh_token(
         &user,
         &auth_state.jwt_secret,
@@ -51,7 +62,7 @@ pub async fn handle_login(
         .add(access_token_cookie(
             access_token.clone(),
             &oidc_config,
-            auth_state.jwt_expiry_hours,
+            access_lifetime,
         ))
         .add(refresh_token_cookie(
             refresh_token.clone(),
@@ -59,21 +70,33 @@ pub async fn handle_login(
             auth_state.refresh_expiry_days,
         ));
 
-    Ok((
+    let response = (
         jar,
         Json(LoginResponse {
             access_token,
             token_type: "Bearer".to_string(),
-            expires_in: auth_state.jwt_expiry_hours * 3600,
+            expires_in: access_lifetime,
             refresh_token,
         }),
-    ))
+    );
+    audit.record(
+        AuditEvent::new("auth.login.success")
+            .actor(user.id)
+            .target("user", user.id.to_string())
+            .ip(peer.ip())
+            .detail(json!({"method": "password"})),
+    );
+    Ok(response)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_refresh(
     Extension(db): Extension<Database>,
     Extension(auth_state): Extension<AuthState>,
     Extension(oidc_config): Extension<OidcConfig>,
+    Extension(security): Extension<SecurityPolicyState>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     jar: CookieJar,
     body: Bytes,
@@ -98,46 +121,100 @@ pub async fn handle_refresh(
         .or_else(|| payload.map(|payload| payload.refresh_token))
         .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "missing refresh token"))?;
 
-    let (user_id, token_ver) = verify_refresh_token(&refresh_token, &auth_state.jwt_secret)
-        .map_err(|_| ApiError::new(StatusCode::UNAUTHORIZED, "invalid refresh token"))?;
+    let identity = match verify_refresh_token(&refresh_token, &auth_state.jwt_secret) {
+        Ok(identity) => identity,
+        Err(_) => {
+            audit.record(
+                AuditEvent::new("auth.refresh.failure")
+                    .ip(peer.ip())
+                    .detail(json!({"reason": "invalid_token"})),
+            );
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "invalid refresh token",
+            ));
+        }
+    };
+    if security
+        .validate_session_issued_at(identity.issued_at)
+        .is_err()
+    {
+        audit.record(
+            AuditEvent::new("auth.refresh.failure")
+                .ip(peer.ip())
+                .detail(json!({"reason": "session_expired"})),
+        );
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "session expired"));
+    }
 
     let user = db
-        .find_user_by_id(user_id)
+        .find_user_by_id(identity.user_id)
         .await
         .map_err(|_| ApiError::internal("user lookup failed"))?
         .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "invalid refresh token user"))?;
 
-    if !user.is_active || user.token_version != token_ver {
+    if !user.is_active || user.token_version != identity.token_version {
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "token revoked"));
     }
+    if user.role == "admin"
+        && !security
+            .admin_ip_allowed(peer.ip())
+            .map_err(|_| ApiError::internal("administrator IP policy check failed"))?
+    {
+        audit.record(
+            AuditEvent::new("auth.refresh.ip_denied")
+                .actor(user.id)
+                .target("user", user.id.to_string())
+                .ip(peer.ip())
+                .detail(json!({"reason": "admin_ip_not_allowed"})),
+        );
+        return Err(ApiError::forbidden("administrator IP is not allowed"));
+    }
 
-    let access_token = sign_access_token(&user, &auth_state)?;
+    let (access_token, access_lifetime) = sign_access_token(&user, &auth_state, &security)?;
     let jar = jar.add(access_token_cookie(
         access_token.clone(),
         &oidc_config,
-        auth_state.jwt_expiry_hours,
+        access_lifetime,
     ));
 
-    Ok((
+    let response = (
         jar,
         Json(RefreshResponse {
             access_token,
             token_type: "Bearer".to_string(),
-            expires_in: auth_state.jwt_expiry_hours * 3600,
+            expires_in: access_lifetime,
         }),
-    ))
+    );
+    audit.record(
+        AuditEvent::new("auth.refresh.success")
+            .actor(user.id)
+            .target("user", user.id.to_string())
+            .ip(peer.ip())
+            .detail(json!({})),
+    );
+    Ok(response)
 }
 
 pub async fn handle_logout(
     Extension(db): Extension<Database>,
     Extension(current): Extension<CurrentUser>,
     Extension(oidc_config): Extension<OidcConfig>,
+    Extension(audit): Extension<AuditService>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
     jar: CookieJar,
     body: Bytes,
 ) -> Result<(CookieJar, StatusCode), ApiError> {
     // 即使注销不使用请求体，也必须完整消费，确保大小限制与总超时生效。
     let _ = body;
     revoke_all_user_tokens(&db, current.id).await?;
+    audit.record(
+        AuditEvent::new("auth.logout")
+            .actor(current.id)
+            .target("user", current.id.to_string())
+            .ip(peer.ip())
+            .detail(json!({})),
+    );
     let jar = jar
         .add(clear_access_token_cookie(&oidc_config))
         .add(clear_refresh_token_cookie(&oidc_config));
