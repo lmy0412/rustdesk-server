@@ -26,6 +26,28 @@ pub struct DeviceListQuery {
     pub q: Option<String>,
     pub page: Option<i64>,
     pub page_size: Option<i64>,
+    pub sort_by: Option<String>,
+    pub sort_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DeviceSortBy {
+    #[default]
+    DeviceId,
+    Alias,
+    Hostname,
+    Os,
+    Status,
+    LastSeen,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SortDirection {
+    #[default]
+    Asc,
+    Desc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +59,8 @@ pub struct ValidatedDeviceListQuery {
     pub page: i64,
     pub page_size: i64,
     pub offset: i64,
+    pub sort_by: DeviceSortBy,
+    pub sort_dir: SortDirection,
 }
 
 impl DeviceListQuery {
@@ -94,6 +118,26 @@ impl DeviceListQuery {
             .checked_sub(1)
             .and_then(|value| value.checked_mul(page_size))
             .ok_or_else(|| ValidationError::bad_request("page offset is too large"))?;
+        let sort_by = match self.sort_by.as_deref().unwrap_or("device_id") {
+            "device_id" => DeviceSortBy::DeviceId,
+            "alias" => DeviceSortBy::Alias,
+            "hostname" => DeviceSortBy::Hostname,
+            "os" => DeviceSortBy::Os,
+            "status" => DeviceSortBy::Status,
+            "last_seen" => DeviceSortBy::LastSeen,
+            "created_at" => DeviceSortBy::CreatedAt,
+            "updated_at" => DeviceSortBy::UpdatedAt,
+            _ => {
+                return Err(ValidationError::bad_request(
+                    "sort_by must be device_id, alias, hostname, os, status, last_seen, created_at, or updated_at",
+                ))
+            }
+        };
+        let sort_dir = match self.sort_dir.as_deref().unwrap_or("asc") {
+            "asc" => SortDirection::Asc,
+            "desc" => SortDirection::Desc,
+            _ => return Err(ValidationError::bad_request("sort_dir must be asc or desc")),
+        };
 
         Ok(ValidatedDeviceListQuery {
             group_id,
@@ -103,6 +147,8 @@ impl DeviceListQuery {
             page,
             page_size,
             offset,
+            sort_by,
+            sort_dir,
         })
     }
 }
@@ -333,6 +379,8 @@ mod tests {
             q: None,
             page: None,
             page_size: None,
+            sort_by: None,
+            sort_dir: None,
         }
         .validate()
         .unwrap();
@@ -347,6 +395,29 @@ mod tests {
         .validate()
         .unwrap();
         assert_eq!(capped.page_size, 200);
+
+        let sorted = DeviceListQuery {
+            sort_by: Some("last_seen".to_string()),
+            sort_dir: Some("desc".to_string()),
+            ..empty_query()
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(sorted.sort_by, DeviceSortBy::LastSeen);
+        assert_eq!(sorted.sort_dir, SortDirection::Desc);
+
+        assert!(DeviceListQuery {
+            sort_by: Some("secret_column".to_string()),
+            ..empty_query()
+        }
+        .validate()
+        .is_err());
+        assert!(DeviceListQuery {
+            sort_dir: Some("sideways".to_string()),
+            ..empty_query()
+        }
+        .validate()
+        .is_err());
 
         assert!(DeviceListQuery {
             page: Some(i64::MAX),
@@ -425,6 +496,8 @@ mod tests {
             q: None,
             page: None,
             page_size: None,
+            sort_by: None,
+            sort_dir: None,
         }
     }
 }

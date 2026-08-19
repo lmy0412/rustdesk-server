@@ -6,6 +6,10 @@ edition = "2021"
 build = "build.rs"
 default-run = "hbbs"
 
+[features]
+default = []
+pro = ["dep:rust-embed"]
+
 [[bin]]
 name = "hbbr"
 path = "src/hbbr.rs"
@@ -66,6 +70,9 @@ protobuf = "3.4"
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 data-encoding = "2"
 thiserror = "1"
+rust-embed = { version = "8", features = ["debug-embed"], optional = true }
+# sodiumoxide 仍依赖 ed25519 1.5 的旧 Signature trait；阻止其宽泛版本约束误选 2.x。
+signature-compat = { package = "signature", version = "=1.5.0" }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 # https://github.com/rustdesk/rustdesk-server-pro/issues/189, using native-tls for better tls support
