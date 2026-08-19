@@ -387,6 +387,9 @@ pub struct ServerConfig {
     pub key_file: String,
     #[serde(default = "default_db_path")]
     pub db_path: String,
+    /// 可选数据库 URL。为空时继续使用 db_path，以保持 OSS/SQLite 配置兼容。
+    #[serde(default)]
+    pub database_url: String,
 }
 
 impl Default for ServerConfig {
@@ -398,6 +401,7 @@ impl Default for ServerConfig {
             key: default_key(),
             key_file: default_key_file(),
             db_path: default_db_path(),
+            database_url: String::new(),
         }
     }
 }
@@ -683,15 +687,43 @@ impl fmt::Display for ServerConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ServerConfig {{ id_server: {}, relay_server: {}, api_server: {}, key: {}, key_file: {}, db_path: {} }}",
+            "ServerConfig {{ id_server: {}, relay_server: {}, api_server: {}, key: {}, key_file: {}, db_path: {}, database_url: {} }}",
             self.id_server,
             self.relay_server,
             self.api_server,
             mask_sensitive(&self.key),
             self.key_file,
-            self.db_path
+            self.db_path,
+            mask_database_url(&self.database_url)
         )
     }
+}
+
+fn mask_database_url(value: &str) -> String {
+    let Some((scheme, remainder)) = value.split_once("://") else {
+        return value.to_string();
+    };
+    let masked = if let Some((credentials, location)) = remainder.rsplit_once('@') {
+        let username = credentials
+            .split_once(':')
+            .map(|(name, _)| name)
+            .unwrap_or(credentials);
+        format!("{scheme}://{username}:***@{location}")
+    } else {
+        format!("{scheme}://{remainder}")
+    };
+    let Some((base, query)) = masked.split_once('?') else {
+        return masked;
+    };
+    let query = query
+        .split('&')
+        .map(|part| match part.split_once('=') {
+            Some((key, _)) if key.eq_ignore_ascii_case("password") => format!("{key}=***"),
+            _ => part.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}?{query}")
 }
 
 impl fmt::Display for ApiRateLimitConfig {
@@ -832,6 +864,15 @@ impl AppConfig {
             .api_server
             .parse::<SocketAddr>()
             .map_err(|e| format!("invalid api_server '{}': {}", self.server.api_server, e))
+    }
+
+    /// 返回 API、设备状态查询和迁移共同使用的数据库定位符。
+    pub fn database_url(&self) -> &str {
+        if self.server.database_url.trim().is_empty() {
+            &self.server.db_path
+        } else {
+            &self.server.database_url
+        }
     }
 
     /// Update the port portion of server.id_server.
@@ -1252,6 +1293,15 @@ fn validate_config(cfg: &AppConfig) -> Result<(), String> {
     checked_listen_port("server.id_server", &cfg.server.id_server)?;
     checked_listen_port("server.relay_server", &cfg.server.relay_server)?;
     checked_listen_port("server.api_server", &cfg.server.api_server)?;
+    if !cfg.server.database_url.trim().is_empty()
+        && !cfg.server.database_url.starts_with("postgres://")
+        && !cfg.server.database_url.starts_with("postgresql://")
+        && !cfg.server.database_url.starts_with("sqlite:")
+    {
+        return Err(
+            "server.database_url must use postgres://, postgresql:// or sqlite: scheme".to_string(),
+        );
+    }
     if cfg.pro.jwt_secret.trim().len() < 32 {
         return Err("pro.jwt_secret must be at least 32 characters".to_string());
     }
@@ -1495,6 +1545,12 @@ fn diff_fields(old: &AppConfig, new: &AppConfig) -> Vec<String> {
     );
     push_diff(
         &mut fields,
+        "server.database_url",
+        &old.server.database_url,
+        &new.server.database_url,
+    );
+    push_diff(
+        &mut fields,
         "rendezvous.servers",
         &old.rendezvous.servers,
         &new.rendezvous.servers,
@@ -1642,6 +1698,7 @@ mod tests {
         assert_eq!(cfg.server.relay_server, "0.0.0.0:21117");
         assert_eq!(cfg.server.api_server, "0.0.0.0:21114");
         assert_eq!(cfg.server.db_path, default_db_path());
+        assert!(cfg.server.database_url.is_empty());
         assert_eq!(cfg.server.key, "-");
         assert_eq!(cfg.rendezvous.serial, 0);
         assert!(cfg.rendezvous.servers.is_empty());
@@ -1653,6 +1710,24 @@ mod tests {
         assert_eq!(cfg.pro.refresh_expiry_days, 7);
         assert!(!cfg.pro.jwt_secret.is_empty());
         assert_eq!(cfg.pro.security, SecurityConfig::default());
+    }
+
+    #[test]
+    fn database_url_overrides_path_and_is_masked() {
+        let mut cfg = AppConfig::default();
+        cfg.server.database_url =
+            "postgresql://rustdesk:top-secret@db.example.com/rustdesk".to_string();
+        assert_eq!(cfg.database_url(), cfg.server.database_url);
+        let shown = cfg.server.to_string();
+        assert!(shown.contains("postgresql://rustdesk:***@db.example.com/rustdesk"));
+        assert!(!shown.contains("top-secret"));
+
+        cfg.server.database_url =
+            "postgresql://db.example.com/rustdesk?sslmode=require&password=query-secret"
+                .to_string();
+        let shown = cfg.server.to_string();
+        assert!(shown.contains("sslmode=require&password=***"));
+        assert!(!shown.contains("query-secret"));
     }
 
     #[test]
@@ -1739,6 +1814,8 @@ mod tests {
 
     #[test]
     fn test_hbbr_port_logic() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_test_env();
         // Simulate: PORT=21116 -> relay port = 21117
         std::env::set_var("PORT", "21116");
         let mut cfg = AppConfig::default();
@@ -1754,7 +1831,7 @@ mod tests {
         };
         cfg.set_relay_server_port(relay_port);
         assert_eq!(cfg.relay_server_port(), 21117);
-        std::env::remove_var("PORT");
+        clear_test_env();
     }
 
     #[test]

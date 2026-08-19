@@ -1,4 +1,4 @@
-use super::Database;
+use super::{Database, DatabaseBackend};
 use crate::models::{
     addressbook::{
         validate_safe_device_text_fields, AddressBookChangeDto, AddressBookDeltaPage,
@@ -8,8 +8,9 @@ use crate::models::{
     },
     user::MAX_SAFE_INTEGER,
 };
+use chrono::NaiveDateTime;
 use hbb_common::{bail, ResultType};
-use sqlx::{sqlite::SqliteRow, Connection, Row, Sqlite, Transaction};
+use sqlx::{any::AnyRow, Any, Connection, Row, Transaction};
 use std::{collections::HashMap, fmt, future::Future, ops::DerefMut};
 
 pub type AddressBookResult<T> = Result<T, AddressBookError>;
@@ -167,7 +168,7 @@ fn instance_id(management_generation: &str) -> String {
 }
 
 fn safe_device_summary_from_row(
-    row: &SqliteRow,
+    row: &AnyRow,
 ) -> AddressBookResult<(String, ShareDeviceSummaryDto)> {
     let device_id = row.try_get::<String, _>("device_id")?;
     validate_device_id(&device_id)?;
@@ -189,7 +190,7 @@ fn safe_device_summary_from_row(
     Ok((lifecycle, summary))
 }
 
-fn membership_from_row(row: &SqliteRow) -> AddressBookResult<Membership> {
+fn membership_from_row(row: &AnyRow) -> AddressBookResult<Membership> {
     let row_id = validate_wire_integer(row.try_get::<i64, _>("row_id")?, false)?;
     let (lifecycle, device) = safe_device_summary_from_row(row)?;
     let source = match row.try_get::<String, _>("source")?.as_str() {
@@ -232,11 +233,11 @@ fn membership_from_row(row: &SqliteRow) -> AddressBookResult<Membership> {
 }
 
 async fn fetch_user_version_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     user_id: i64,
 ) -> AddressBookResult<Option<i64>> {
     let version =
-        sqlx::query_scalar::<_, i64>("SELECT address_book_version FROM users WHERE id = ?")
+        sqlx::query_scalar::<_, i64>("SELECT address_book_version FROM users WHERE id = $1")
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?;
@@ -245,11 +246,8 @@ async fn fetch_user_version_in_tx(
         .transpose()
 }
 
-async fn ensure_writer_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    user_id: i64,
-) -> AddressBookResult<()> {
-    let role = sqlx::query("SELECT role, is_active FROM users WHERE id = ?")
+async fn ensure_writer_in_tx(tx: &mut Transaction<'_, Any>, user_id: i64) -> AddressBookResult<()> {
+    let role = sqlx::query("SELECT role, is_active FROM users WHERE id = $1")
         .bind(user_id)
         .fetch_optional(&mut *tx)
         .await?;
@@ -271,7 +269,7 @@ async fn ensure_writer_in_tx(
 }
 
 async fn current_membership_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     user_id: i64,
 ) -> AddressBookResult<Vec<Membership>> {
     let rows = sqlx::query(
@@ -288,7 +286,7 @@ async fn current_membership_in_tx(
              NULL AS shared_by_user_id,
              NULL AS shared_by_username
          FROM devices d
-         WHERE d.owner_user_id = ?
+         WHERE d.owner_user_id = $1
          UNION ALL
          SELECT
              d.id AS row_id,
@@ -308,7 +306,7 @@ async fn current_membership_in_tx(
           AND d.management_generation = s.device_lifecycle
           AND d.device_id = s.device_id
          JOIN users owner ON owner.id = s.from_user_id
-         WHERE s.to_user_id = ? AND s.status = 'accepted'
+         WHERE s.to_user_id = $2 AND s.status = 'accepted'
          ORDER BY device_id, device_lifecycle",
     )
     .bind(user_id)
@@ -319,7 +317,7 @@ async fn current_membership_in_tx(
 }
 
 async fn membership_for_device_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     row_id: i64,
 ) -> AddressBookResult<Vec<(i64, Membership)>> {
     let rows = sqlx::query(
@@ -337,7 +335,7 @@ async fn membership_for_device_in_tx(
              NULL AS shared_by_user_id,
              NULL AS shared_by_username
          FROM devices d
-         WHERE d.id = ? AND d.owner_user_id IS NOT NULL
+         WHERE d.id = $1 AND d.owner_user_id IS NOT NULL
          UNION ALL
          SELECT
              s.to_user_id AS visible_user_id,
@@ -358,7 +356,7 @@ async fn membership_for_device_in_tx(
           AND d.management_generation = s.device_lifecycle
           AND d.device_id = s.device_id
          JOIN users owner ON owner.id = s.from_user_id
-         WHERE d.id = ? AND s.status = 'accepted'
+         WHERE d.id = $2 AND s.status = 'accepted'
          ORDER BY visible_user_id",
     )
     .bind(row_id)
@@ -374,7 +372,7 @@ async fn membership_for_device_in_tx(
 }
 
 async fn append_change_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     user_id: i64,
     membership: &Membership,
     operation: AddressBookOperation,
@@ -383,7 +381,7 @@ async fn append_change_in_tx(
     let next = sqlx::query_scalar::<_, i64>(
         "UPDATE users
          SET address_book_version = address_book_version + 1
-         WHERE id = ? AND address_book_version < ?
+         WHERE id = $1 AND address_book_version < $2
          RETURNING address_book_version",
     )
     .bind(user_id)
@@ -404,7 +402,7 @@ async fn append_change_in_tx(
         "INSERT INTO address_book_changes(
              user_id, version, device_row_id, device_lifecycle,
              device_id, share_id, operation, payload
-         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(user_id)
     .bind(next)
@@ -420,7 +418,7 @@ async fn append_change_in_tx(
 }
 
 pub(super) async fn upsert_device_memberships_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     row_id: i64,
 ) -> AddressBookResult<()> {
     for (user_id, membership) in membership_for_device_in_tx(tx, row_id).await? {
@@ -430,13 +428,13 @@ pub(super) async fn upsert_device_memberships_in_tx(
 }
 
 pub(super) async fn delete_device_memberships_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     row_id: i64,
 ) -> AddressBookResult<()> {
     for (user_id, membership) in membership_for_device_in_tx(tx, row_id).await? {
         append_change_in_tx(tx, user_id, &membership, AddressBookOperation::Delete).await?;
     }
-    sqlx::query("DELETE FROM device_shares WHERE device_row_id = ?")
+    sqlx::query("DELETE FROM device_shares WHERE device_row_id = $1")
         .bind(row_id)
         .execute(&mut *tx)
         .await?;
@@ -444,7 +442,7 @@ pub(super) async fn delete_device_memberships_in_tx(
 }
 
 pub(super) async fn rename_device_memberships_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     row_id: i64,
     old_device_id: &str,
 ) -> AddressBookResult<()> {
@@ -460,7 +458,7 @@ pub(super) async fn rename_device_memberships_in_tx(
 }
 
 async fn latest_items_at_version_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     user_id: i64,
     version: i64,
     limit: Option<i64>,
@@ -470,20 +468,20 @@ async fn latest_items_at_version_in_tx(
         "WITH latest AS (
              SELECT device_lifecycle, MAX(version) AS version
              FROM address_book_changes
-             WHERE user_id = ? AND version <= ?
+             WHERE user_id = $1 AND version <= $2
              GROUP BY device_lifecycle
          )
          SELECT changes.payload
          FROM latest
          JOIN address_book_changes changes
-           ON changes.user_id = ?
+           ON changes.user_id = $3
           AND changes.device_lifecycle = latest.device_lifecycle
           AND changes.version = latest.version
          WHERE changes.operation = 'upsert'
          ORDER BY changes.device_id, changes.device_lifecycle",
     );
     if limit.is_some() {
-        sql.push_str(" LIMIT ? OFFSET ?");
+        sql.push_str(" LIMIT $4 OFFSET $5");
     }
     let mut query = sqlx::query(&sql).bind(user_id).bind(version).bind(user_id);
     if let Some(limit) = limit {
@@ -501,7 +499,7 @@ async fn latest_items_at_version_in_tx(
 }
 
 async fn latest_item_count_at_version_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     user_id: i64,
     version: i64,
 ) -> AddressBookResult<i64> {
@@ -509,13 +507,13 @@ async fn latest_item_count_at_version_in_tx(
         "WITH latest AS (
              SELECT device_lifecycle, MAX(version) AS version
              FROM address_book_changes
-             WHERE user_id = ? AND version <= ?
+             WHERE user_id = $1 AND version <= $2
              GROUP BY device_lifecycle
          )
          SELECT COUNT(*)
          FROM latest
          JOIN address_book_changes changes
-           ON changes.user_id = ?
+           ON changes.user_id = $3
           AND changes.device_lifecycle = latest.device_lifecycle
           AND changes.version = latest.version
          WHERE changes.operation = 'upsert'",
@@ -528,7 +526,7 @@ async fn latest_item_count_at_version_in_tx(
     validate_wire_integer(total, true)
 }
 
-fn change_from_row(row: &SqliteRow) -> AddressBookResult<AddressBookChangeDto> {
+fn change_from_row(row: &AnyRow) -> AddressBookResult<AddressBookChangeDto> {
     let version = validate_wire_integer(row.try_get::<i64, _>("version")?, false)?;
     let operation = AddressBookOperation::try_from(row.try_get::<String, _>("operation")?.as_str())
         .map_err(AddressBookError::Integrity)?;
@@ -620,7 +618,7 @@ fn apply_change_to_replay_state(
     Ok(())
 }
 
-fn share_dto_from_row(row: &SqliteRow) -> AddressBookResult<ShareDto> {
+fn share_dto_from_row(row: &AnyRow) -> AddressBookResult<ShareDto> {
     let id = validate_wire_integer(row.try_get::<i64, _>("id")?, false)?;
     let from_user_id = validate_wire_integer(row.try_get::<i64, _>("from_user_id")?, false)?;
     let to_user_id = validate_wire_integer(row.try_get::<i64, _>("to_user_id")?, false)?;
@@ -636,9 +634,14 @@ fn share_dto_from_row(row: &SqliteRow) -> AddressBookResult<ShareDto> {
             .map_err(AddressBookError::Integrity)?,
         status: ShareStatus::try_from(row.try_get::<String, _>("status")?.as_str())
             .map_err(AddressBookError::Integrity)?,
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
+        created_at: wire_timestamp(row, "created_at")?,
+        updated_at: wire_timestamp(row, "updated_at")?,
     })
+}
+
+fn wire_timestamp(row: &AnyRow, column: &str) -> AddressBookResult<String> {
+    let value = row.try_get::<NaiveDateTime, _>(column)?;
+    Ok(value.format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
 const SHARE_DTO_SELECT: &str = "
@@ -655,8 +658,8 @@ const SHARE_DTO_SELECT: &str = "
         recipient.username AS to_username,
         s.permission,
         s.status,
-        strftime('%Y-%m-%dT%H:%M:%SZ', s.created_at) AS created_at,
-        strftime('%Y-%m-%dT%H:%M:%SZ', s.updated_at) AS updated_at
+        s.created_at,
+        s.updated_at
     FROM device_shares s
     JOIN devices d
       ON d.id = s.device_row_id
@@ -667,10 +670,10 @@ const SHARE_DTO_SELECT: &str = "
 ";
 
 async fn fetch_share_dto_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     share_id: i64,
 ) -> AddressBookResult<Option<ShareDto>> {
-    let row = sqlx::query(&format!("{SHARE_DTO_SELECT} WHERE s.id = ?"))
+    let row = sqlx::query(&format!("{SHARE_DTO_SELECT} WHERE s.id = $1"))
         .bind(share_id)
         .fetch_optional(&mut *tx)
         .await?;
@@ -678,7 +681,7 @@ async fn fetch_share_dto_in_tx(
 }
 
 async fn fetch_shared_membership_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     share_id: i64,
 ) -> AddressBookResult<Option<(i64, Membership)>> {
     let row = sqlx::query(
@@ -701,7 +704,7 @@ async fn fetch_shared_membership_in_tx(
           AND d.management_generation = s.device_lifecycle
           AND d.device_id = s.device_id
          JOIN users owner ON owner.id = s.from_user_id
-         WHERE s.id = ?",
+         WHERE s.id = $1",
     )
     .bind(share_id)
     .fetch_optional(&mut *tx)
@@ -835,9 +838,9 @@ impl Database {
         let rows = sqlx::query(
             "SELECT version, operation, device_id, device_lifecycle, share_id, payload
              FROM address_book_changes
-             WHERE user_id = ? AND version > ? AND version <= ?
+             WHERE user_id = $1 AND version > $2 AND version <= $3
              ORDER BY version
-             LIMIT ?",
+             LIMIT $4",
         )
         .bind(user_id)
         .bind(cursor)
@@ -906,17 +909,17 @@ impl Database {
                  s.from_user_id,
                  owner.username AS from_username,
                  s.permission,
-                 strftime('%Y-%m-%dT%H:%M:%SZ', s.created_at) AS created_at,
-                 strftime('%Y-%m-%dT%H:%M:%SZ', s.updated_at) AS updated_at
+                 s.created_at,
+                 s.updated_at
              FROM device_shares s
              JOIN devices d
                ON d.id = s.device_row_id
               AND d.management_generation = s.device_lifecycle
               AND d.device_id = s.device_id
              JOIN users owner ON owner.id = s.from_user_id
-             WHERE s.to_user_id = ? AND s.status = 'pending' AND s.id > ?
+             WHERE s.to_user_id = $1 AND s.status = 'pending' AND s.id > $2
              ORDER BY s.id
-             LIMIT ?",
+             LIMIT $3",
         )
         .bind(user_id)
         .bind(after_id)
@@ -939,8 +942,8 @@ impl Database {
                     row.try_get::<String, _>("permission")?.as_str(),
                 )
                 .map_err(AddressBookError::Integrity)?,
-                created_at: row.try_get("created_at")?,
-                updated_at: row.try_get("updated_at")?,
+                created_at: wire_timestamp(row, "created_at")?,
+                updated_at: wire_timestamp(row, "updated_at")?,
             });
         }
         let next_after_id = items.last().map(|item| item.id).unwrap_or(after_id);
@@ -994,7 +997,7 @@ impl Database {
         let device = sqlx::query(
             "SELECT id, management_generation, device_id
              FROM devices
-             WHERE device_id = ? AND owner_user_id = ?",
+             WHERE device_id = $1 AND owner_user_id = $2",
         )
         .bind(device_id)
         .bind(actor_user_id)
@@ -1006,7 +1009,7 @@ impl Database {
         let target = sqlx::query(
             "SELECT id
              FROM users
-             WHERE username = ? AND is_active = 1 AND role IN ('admin', 'user')",
+             WHERE username = $1 AND is_active = TRUE AND role IN ('admin', 'user')",
         )
         .bind(to_username)
         .fetch_optional(&mut tx)
@@ -1019,7 +1022,7 @@ impl Database {
         let existing = sqlx::query(
             "SELECT id, permission, status
              FROM device_shares
-             WHERE device_row_id = ? AND to_user_id = ?",
+             WHERE device_row_id = $1 AND to_user_id = $2",
         )
         .bind(row_id)
         .bind(target_id)
@@ -1034,8 +1037,8 @@ impl Database {
                     if existing_permission != permission.as_str() {
                         sqlx::query(
                             "UPDATE device_shares
-                             SET permission = ?, updated_at = current_timestamp
-                             WHERE id = ?",
+                             SET permission = $1, updated_at = current_timestamp
+                             WHERE id = $2",
                         )
                         .bind(permission.as_str())
                         .bind(existing_id)
@@ -1049,8 +1052,8 @@ impl Database {
                     if changed {
                         sqlx::query(
                             "UPDATE device_shares
-                             SET permission = ?, updated_at = current_timestamp
-                             WHERE id = ?",
+                             SET permission = $1, updated_at = current_timestamp
+                             WHERE id = $2",
                         )
                         .bind(permission.as_str())
                         .bind(existing_id)
@@ -1060,7 +1063,7 @@ impl Database {
                     (existing_id, false, changed)
                 }
                 "rejected" => {
-                    sqlx::query("DELETE FROM device_shares WHERE id = ?")
+                    sqlx::query("DELETE FROM device_shares WHERE id = $1")
                         .bind(existing_id)
                         .execute(&mut tx)
                         .await?;
@@ -1068,7 +1071,7 @@ impl Database {
                         "INSERT INTO device_shares(
                              device_row_id, device_lifecycle, device_id,
                              from_user_id, to_user_id, permission, status
-                         ) VALUES(?, ?, ?, ?, ?, ?, 'pending')
+                         ) VALUES($1, $2, $3, $4, $5, $6, 'pending')
                          RETURNING id",
                     )
                     .bind(row_id)
@@ -1092,7 +1095,7 @@ impl Database {
                 "INSERT INTO device_shares(
                      device_row_id, device_lifecycle, device_id,
                      from_user_id, to_user_id, permission, status
-                 ) VALUES(?, ?, ?, ?, ?, ?, 'pending')
+                 ) VALUES($1, $2, $3, $4, $5, $6, 'pending')
                  RETURNING id",
             )
             .bind(row_id)
@@ -1143,14 +1146,14 @@ impl Database {
             .map_err(inventory_lock_error)?;
         ensure_writer_in_tx(&mut tx, actor_user_id).await?;
         let device_row_id = sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM devices WHERE device_id = ? AND owner_user_id = ?",
+            "SELECT id FROM devices WHERE device_id = $1 AND owner_user_id = $2",
         )
         .bind(device_id)
         .bind(actor_user_id)
         .fetch_optional(&mut tx)
         .await?
         .ok_or(AddressBookError::NotFound)?;
-        let target_id = sqlx::query_scalar::<_, i64>("SELECT id FROM users WHERE username = ?")
+        let target_id = sqlx::query_scalar::<_, i64>("SELECT id FROM users WHERE username = $1")
             .bind(to_username)
             .fetch_optional(&mut tx)
             .await?;
@@ -1161,7 +1164,7 @@ impl Database {
         let share = sqlx::query(
             "SELECT id, status
              FROM device_shares
-             WHERE device_row_id = ? AND to_user_id = ?",
+             WHERE device_row_id = $1 AND to_user_id = $2",
         )
         .bind(device_row_id)
         .bind(target_id)
@@ -1186,7 +1189,7 @@ impl Database {
             )
             .await?;
         }
-        sqlx::query("DELETE FROM device_shares WHERE id = ?")
+        sqlx::query("DELETE FROM device_shares WHERE id = $1")
             .bind(share_id)
             .execute(&mut tx)
             .await?;
@@ -1244,19 +1247,20 @@ impl Database {
             .await
             .map_err(inventory_lock_error)?;
         ensure_writer_in_tx(&mut tx, actor_user_id).await?;
-        let state = sqlx::query("SELECT status FROM device_shares WHERE id = ? AND to_user_id = ?")
-            .bind(share_id)
-            .bind(actor_user_id)
-            .fetch_optional(&mut tx)
-            .await?
-            .ok_or(AddressBookError::NotFound)?
-            .try_get::<String, _>("status")?;
+        let state =
+            sqlx::query("SELECT status FROM device_shares WHERE id = $1 AND to_user_id = $2")
+                .bind(share_id)
+                .bind(actor_user_id)
+                .fetch_optional(&mut tx)
+                .await?
+                .ok_or(AddressBookError::NotFound)?
+                .try_get::<String, _>("status")?;
         match (accept, state.as_str()) {
             (true, "pending") => {
                 sqlx::query(
                     "UPDATE device_shares
                      SET status = 'accepted', updated_at = current_timestamp
-                     WHERE id = ?",
+                     WHERE id = $1",
                 )
                 .bind(share_id)
                 .execute(&mut tx)
@@ -1284,7 +1288,7 @@ impl Database {
                 sqlx::query(
                     "UPDATE device_shares
                      SET status = 'rejected', updated_at = current_timestamp
-                     WHERE id = ?",
+                     WHERE id = $1",
                 )
                 .bind(share_id)
                 .execute(&mut tx)
@@ -1306,7 +1310,7 @@ impl Database {
                 sqlx::query(
                     "UPDATE device_shares
                      SET status = 'rejected', updated_at = current_timestamp
-                     WHERE id = ?",
+                     WHERE id = $1",
                 )
                 .bind(share_id)
                 .execute(&mut tx)
@@ -1336,7 +1340,7 @@ impl Database {
         let row = sqlx::query(
             "SELECT management_generation, owner_user_id
              FROM devices
-             WHERE device_id = ? AND uuid = ?",
+             WHERE device_id = $1 AND uuid = $2",
         )
         .bind(device_id)
         .bind(uuid)
@@ -1408,7 +1412,7 @@ impl Database {
         let row = sqlx::query(
             "SELECT id, owner_user_id, device_name, os
              FROM devices
-             WHERE device_id = ? AND uuid = ? AND management_generation = ?",
+             WHERE device_id = $1 AND uuid = $2 AND management_generation = $3",
         )
         .bind(device_id)
         .bind(uuid)
@@ -1446,10 +1450,10 @@ impl Database {
         if changed {
             sqlx::query(
                 "UPDATE devices
-                 SET device_name = CASE WHEN ? IS NULL THEN device_name ELSE ? END,
-                     os = CASE WHEN ? IS NULL THEN os ELSE ? END,
+                 SET device_name = CASE WHEN $1 IS NULL THEN device_name ELSE $2 END,
+                     os = CASE WHEN $3 IS NULL THEN os ELSE $4 END,
                      updated_at = current_timestamp
-                 WHERE id = ?",
+                 WHERE id = $5",
             )
             .bind(hostname)
             .bind(hostname)
@@ -1474,7 +1478,10 @@ impl Database {
     }
 }
 
-pub(super) async fn initialize_address_book(tx: &mut Transaction<'_, Sqlite>) -> ResultType<()> {
+pub(super) async fn initialize_address_book(
+    tx: &mut Transaction<'_, Any>,
+    backend: DatabaseBackend,
+) -> ResultType<()> {
     let completed = sqlx::query_scalar::<_, i64>(
         "SELECT completed FROM address_book_backfill_state WHERE id = 1",
     )
@@ -1525,12 +1532,14 @@ pub(super) async fn initialize_address_book(tx: &mut Transaction<'_, Sqlite>) ->
     } else if completed != 1 {
         bail!("address-book backfill marker is invalid");
     }
-    verify_address_book_integrity(tx).await
+    if backend == DatabaseBackend::Sqlite {
+        verify_address_book_integrity(tx).await
+    } else {
+        Ok(())
+    }
 }
 
-pub(super) async fn verify_address_book_integrity(
-    tx: &mut Transaction<'_, Sqlite>,
-) -> ResultType<()> {
+pub(super) async fn verify_address_book_integrity(tx: &mut Transaction<'_, Any>) -> ResultType<()> {
     if let Some(row) = sqlx::query(
         "SELECT id, username, token_version, address_book_version
          FROM users
@@ -1950,15 +1959,15 @@ mod tests {
         .unwrap();
     }
 
-    async fn delete_device_in_tx(tx: &mut Transaction<'_, Sqlite>, device_id: &str) -> i64 {
-        let row_id = sqlx::query_scalar::<_, i64>("SELECT id FROM devices WHERE device_id = ?")
+    async fn delete_device_in_tx(tx: &mut Transaction<'_, Any>, device_id: &str) -> i64 {
+        let row_id = sqlx::query_scalar::<_, i64>("SELECT id FROM devices WHERE device_id = $1")
             .bind(device_id)
             .fetch_one(&mut *tx)
             .await
             .unwrap();
         delete_device_memberships_in_tx(tx, row_id).await.unwrap();
         assert_eq!(
-            sqlx::query("DELETE FROM devices WHERE id = ?")
+            sqlx::query("DELETE FROM devices WHERE id = $1")
                 .bind(row_id)
                 .execute(&mut *tx)
                 .await
@@ -1970,11 +1979,11 @@ mod tests {
     }
 
     async fn transfer_device_in_tx(
-        tx: &mut Transaction<'_, Sqlite>,
+        tx: &mut Transaction<'_, Any>,
         device_id: &str,
         new_owner: i64,
     ) -> i64 {
-        let row_id = sqlx::query_scalar::<_, i64>("SELECT id FROM devices WHERE device_id = ?")
+        let row_id = sqlx::query_scalar::<_, i64>("SELECT id FROM devices WHERE device_id = $1")
             .bind(device_id)
             .fetch_one(&mut *tx)
             .await
@@ -1983,8 +1992,8 @@ mod tests {
         assert_eq!(
             sqlx::query(
                 "UPDATE devices
-                 SET owner_user_id = ?, updated_at = current_timestamp
-                 WHERE id = ?",
+                 SET owner_user_id = $1, updated_at = current_timestamp
+                 WHERE id = $2",
             )
             .bind(new_owner)
             .bind(row_id)
@@ -2027,7 +2036,7 @@ mod tests {
                     .execute(connection.deref_mut())
                     .await
                     .unwrap();
-                sqlx::query("UPDATE device_shares SET id = ? WHERE id = ?")
+                sqlx::query("UPDATE device_shares SET id = $1 WHERE id = $2")
                     .bind(MAX_SAFE_INTEGER + 1)
                     .bind(share.share.id)
                     .execute(connection.deref_mut())
@@ -2317,7 +2326,7 @@ mod tests {
             let payload = sqlx::query_scalar::<_, String>(
                 "SELECT payload
                  FROM address_book_changes
-                 WHERE user_id = ? AND version = 1",
+                 WHERE user_id = $1 AND version = 1",
             )
             .bind(owner)
             .fetch_one(connection.deref_mut())
@@ -2329,9 +2338,9 @@ mod tests {
             let tampered_payload = serde_json::to_string(&item).unwrap();
             sqlx::query(
                 "UPDATE address_book_changes
-                 SET device_lifecycle = ?,
-                     payload = CASE WHEN operation = 'upsert' THEN ? ELSE NULL END
-                 WHERE user_id = ?",
+                 SET device_lifecycle = $1,
+                     payload = CASE WHEN operation = 'upsert' THEN $2 ELSE NULL END
+                 WHERE user_id = $3",
             )
             .bind(&tampered_lifecycle)
             .bind(tampered_payload)
@@ -2362,7 +2371,7 @@ mod tests {
                 .unwrap();
 
             let mut connection = db.pool.get().await.unwrap();
-            sqlx::query("UPDATE devices SET owner_user_id = ? WHERE device_id = 'history-device'")
+            sqlx::query("UPDATE devices SET owner_user_id = $1 WHERE device_id = 'history-device'")
                 .bind(owner)
                 .execute(connection.deref_mut())
                 .await
@@ -2395,7 +2404,7 @@ mod tests {
                 .execute(connection.deref_mut())
                 .await
                 .unwrap();
-            sqlx::query("UPDATE users SET address_book_version = 100000 WHERE id = ?")
+            sqlx::query("UPDATE users SET address_book_version = 100000 WHERE id = $1")
                 .bind(owner)
                 .execute(connection.deref_mut())
                 .await
@@ -2408,8 +2417,8 @@ mod tests {
                      user_id, version, device_row_id, device_lifecycle,
                      device_id, share_id, operation, payload
                  )
-                 SELECT ?, 1 + a.n + 10*b.n + 100*c.n + 1000*d.n + 10000*e.n,
-                        ?, ?, 'history-device', NULL, 'upsert', ?
+                 SELECT $1, 1 + a.n + 10*b.n + 100*c.n + 1000*d.n + 10000*e.n,
+                        $2, $3, 'history-device', NULL, 'upsert', $4
                  FROM digits a
                  CROSS JOIN digits b
                  CROSS JOIN digits c
@@ -2429,18 +2438,18 @@ mod tests {
                  WITH latest AS (
                      SELECT device_lifecycle, MAX(version) AS version
                      FROM address_book_changes
-                     WHERE user_id = ? AND version <= ?
+                     WHERE user_id = $1 AND version <= $2
                      GROUP BY device_lifecycle
                  )
                  SELECT changes.payload
                  FROM latest
                  JOIN address_book_changes changes
-                   ON changes.user_id = ?
+                   ON changes.user_id = $3
                   AND changes.device_lifecycle = latest.device_lifecycle
                   AND changes.version = latest.version
                  WHERE changes.operation = 'upsert'
                  ORDER BY changes.device_id, changes.device_lifecycle
-                 LIMIT ? OFFSET ?",
+                 LIMIT $4 OFFSET $5",
             )
             .bind(owner)
             .bind(100_000_i64)
@@ -2489,7 +2498,7 @@ mod tests {
                 .unwrap();
 
             let mut connection = db.pool.get().await.unwrap();
-            sqlx::query("UPDATE sqlite_sequence SET seq = ? WHERE name = 'users'")
+            sqlx::query("UPDATE sqlite_sequence SET seq = $1 WHERE name = 'users'")
                 .bind(MAX_SAFE_INTEGER - 1)
                 .execute(connection.deref_mut())
                 .await
@@ -2515,7 +2524,7 @@ mod tests {
                 .execute(connection.deref_mut())
                 .await
                 .unwrap();
-            sqlx::query("INSERT INTO sqlite_sequence(name, seq) VALUES('device_shares', ?)")
+            sqlx::query("INSERT INTO sqlite_sequence(name, seq) VALUES('device_shares', $1)")
                 .bind(MAX_SAFE_INTEGER - 1)
                 .execute(connection.deref_mut())
                 .await
@@ -2548,13 +2557,13 @@ mod tests {
                 .execute(connection.deref_mut())
                 .await
                 .unwrap();
-            sqlx::query("UPDATE address_book_changes SET version = ? WHERE user_id = ?")
+            sqlx::query("UPDATE address_book_changes SET version = $1 WHERE user_id = $2")
                 .bind(MAX_SAFE_INTEGER - 1)
                 .bind(owner)
                 .execute(connection.deref_mut())
                 .await
                 .unwrap();
-            sqlx::query("UPDATE users SET address_book_version = ? WHERE id = ?")
+            sqlx::query("UPDATE users SET address_book_version = $1 WHERE id = $2")
                 .bind(MAX_SAFE_INTEGER - 1)
                 .bind(owner)
                 .execute(connection.deref_mut())
@@ -2575,7 +2584,7 @@ mod tests {
                 .unwrap();
             assert_eq!(at_max.address_book_version, MAX_SAFE_INTEGER);
             let before_count = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM address_book_changes WHERE user_id = ?",
+                "SELECT COUNT(*) FROM address_book_changes WHERE user_id = $1",
             )
             .bind(owner)
             .fetch_one(db.pool.get().await.unwrap().deref_mut())
@@ -2598,7 +2607,7 @@ mod tests {
             assert_eq!(current.items[0].hostname, "at-max");
             assert_eq!(
                 sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM address_book_changes WHERE user_id = ?",
+                    "SELECT COUNT(*) FROM address_book_changes WHERE user_id = $1",
                 )
                 .bind(owner)
                 .fetch_one(db.pool.get().await.unwrap().deref_mut())
@@ -2890,7 +2899,7 @@ mod tests {
             };
             entered.wait().await;
             assert_eq!(
-                sqlx::query("DELETE FROM device_shares WHERE id = ?")
+                sqlx::query("DELETE FROM device_shares WHERE id = $1")
                     .bind(share_id)
                     .execute(&mut holder_tx)
                     .await

@@ -7,15 +7,15 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use hbb_common::{bail, log, ResultType};
 use sqlx::{
-    sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, Row, Sqlite,
-    SqliteConnection, Transaction,
+    any::{AnyQueryResult, AnyRow},
+    Any, AnyConnection, Connection, Error as SqlxError, Executor, Row, Transaction,
 };
+#[cfg(windows)]
+use std::time::Duration;
 use std::{
     ops::DerefMut,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
 };
 //use sqlx::postgres::PgPoolOptions;
 //use sqlx::mysql::MySqlPoolOptions;
@@ -29,10 +29,11 @@ pub use inventory::*;
 type Pool = deadpool::managed::Pool<DbPool>;
 static NEXT_DATABASE_SCOPE: AtomicU64 = AtomicU64::new(1);
 const USER_COLUMNS: &str = "id, username, password_hash, email, role, is_active, token_version, failed_login_count, locked_until, oauth_provider, oauth_subject, last_login_at, created_at, updated_at";
-const DEVICE_COLUMNS: &str = "guid, device_id AS id, uuid, pk, CAST(NULL AS BLOB) AS user, info, status, last_seen, note, owner_user_id, group_id, features, token_version, management_generation";
+const DEVICE_COLUMNS: &str = "guid, device_id AS id, uuid, pk, NULL AS user, info, status, last_seen, note, owner_user_id, group_id, features, token_version, management_generation";
 
 pub struct DbPool {
     url: String,
+    backend: DatabaseBackend,
 }
 
 struct DatabaseMigrationLock {
@@ -130,18 +131,19 @@ impl Drop for DatabaseMigrationLock {
 
 #[async_trait]
 impl deadpool::managed::Manager for DbPool {
-    type Type = SqliteConnection;
+    type Type = AnyConnection;
     type Error = SqlxError;
-    async fn create(&self) -> Result<SqliteConnection, SqlxError> {
-        let mut opt = SqliteConnectOptions::from_str(&self.url).unwrap();
-        opt = opt.busy_timeout(Duration::from_secs(2));
-        opt = opt.foreign_keys(true);
-        opt.log_statements(log::LevelFilter::Debug);
-        SqliteConnection::connect_with(&opt).await
+    async fn create(&self) -> Result<AnyConnection, SqlxError> {
+        let mut connection = AnyConnection::connect(&self.url).await?;
+        if self.backend == DatabaseBackend::Sqlite {
+            connection.execute("PRAGMA busy_timeout = 2000").await?;
+            connection.execute("PRAGMA foreign_keys = ON").await?;
+        }
+        Ok(connection)
     }
     async fn recycle(
         &self,
-        obj: &mut SqliteConnection,
+        obj: &mut AnyConnection,
     ) -> deadpool::managed::RecycleResult<SqlxError> {
         Ok(obj.ping().await?)
     }
@@ -151,6 +153,161 @@ impl deadpool::managed::Manager for DbPool {
 pub struct Database {
     pool: Pool,
     auth_cache_scope: u64,
+    backend: DatabaseBackend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseBackend {
+    Sqlite,
+    PostgreSql,
+}
+
+pub(super) enum PortableBind {
+    I64(i64),
+    Bool(bool),
+    Text(String),
+}
+
+pub(super) trait IntoPortableBind {
+    fn into_portable_bind(self) -> PortableBind;
+}
+
+impl IntoPortableBind for i64 {
+    fn into_portable_bind(self) -> PortableBind {
+        PortableBind::I64(self)
+    }
+}
+
+impl IntoPortableBind for bool {
+    fn into_portable_bind(self) -> PortableBind {
+        PortableBind::Bool(self)
+    }
+}
+
+impl IntoPortableBind for String {
+    fn into_portable_bind(self) -> PortableBind {
+        PortableBind::Text(self)
+    }
+}
+
+impl IntoPortableBind for &str {
+    fn into_portable_bind(self) -> PortableBind {
+        PortableBind::Text(self.to_string())
+    }
+}
+
+impl IntoPortableBind for &String {
+    fn into_portable_bind(self) -> PortableBind {
+        PortableBind::Text(self.clone())
+    }
+}
+
+pub(super) struct PortableQuery {
+    sql: String,
+    binds: Vec<PortableBind>,
+}
+
+impl PortableQuery {
+    pub fn new(sql: impl Into<String>) -> Self {
+        Self {
+            sql: sql.into(),
+            binds: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, fragment: impl AsRef<str>) -> &mut Self {
+        self.sql.push_str(fragment.as_ref());
+        self
+    }
+
+    pub fn push_bind(&mut self, value: impl IntoPortableBind) -> &mut Self {
+        self.binds.push(value.into_portable_bind());
+        self.sql.push('$');
+        self.sql.push_str(&self.binds.len().to_string());
+        self
+    }
+
+    pub fn push_bind_list<'a, T: IntoPortableBind + 'a>(
+        &mut self,
+        values: impl IntoIterator<Item = T>,
+    ) -> &mut Self {
+        let mut first = true;
+        for value in values {
+            if !first {
+                self.push(", ");
+            }
+            first = false;
+            self.push_bind(value);
+        }
+        self
+    }
+
+    pub async fn fetch_one(self, connection: &mut AnyConnection) -> Result<AnyRow, SqlxError> {
+        let (sql, binds) = (self.sql, self.binds);
+        let mut query = sqlx::query(&sql);
+        for value in binds {
+            query = match value {
+                PortableBind::I64(value) => query.bind(value),
+                PortableBind::Bool(value) => query.bind(value),
+                PortableBind::Text(value) => query.bind(value),
+            };
+        }
+        query.fetch_one(connection).await
+    }
+
+    pub async fn fetch_optional(
+        self,
+        connection: &mut AnyConnection,
+    ) -> Result<Option<AnyRow>, SqlxError> {
+        let (sql, binds) = (self.sql, self.binds);
+        let mut query = sqlx::query(&sql);
+        for value in binds {
+            query = match value {
+                PortableBind::I64(value) => query.bind(value),
+                PortableBind::Bool(value) => query.bind(value),
+                PortableBind::Text(value) => query.bind(value),
+            };
+        }
+        query.fetch_optional(connection).await
+    }
+
+    pub async fn fetch_all(self, connection: &mut AnyConnection) -> Result<Vec<AnyRow>, SqlxError> {
+        let (sql, binds) = (self.sql, self.binds);
+        let mut query = sqlx::query(&sql);
+        for value in binds {
+            query = match value {
+                PortableBind::I64(value) => query.bind(value),
+                PortableBind::Bool(value) => query.bind(value),
+                PortableBind::Text(value) => query.bind(value),
+            };
+        }
+        query.fetch_all(connection).await
+    }
+
+    pub async fn execute(
+        self,
+        connection: &mut AnyConnection,
+    ) -> Result<AnyQueryResult, SqlxError> {
+        let (sql, binds) = (self.sql, self.binds);
+        let mut query = sqlx::query(&sql);
+        for value in binds {
+            query = match value {
+                PortableBind::I64(value) => query.bind(value),
+                PortableBind::Bool(value) => query.bind(value),
+                PortableBind::Text(value) => query.bind(value),
+            };
+        }
+        query.execute(connection).await
+    }
+}
+
+impl DatabaseBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sqlite => "sqlite",
+            Self::PostgreSql => "postgresql",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, sqlx::FromRow)]
@@ -270,39 +427,70 @@ pub struct LicenseRecord {
 
 impl Database {
     pub async fn new(url: &str) -> ResultType<Database> {
-        if let Some(parent) = std::path::Path::new(url).parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).ok();
+        let backend = database_backend(url)?;
+        let connection_url = normalize_database_url(url, backend)?;
+        let migration_lock = if backend == DatabaseBackend::Sqlite {
+            let path = sqlite_path(url)?;
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
             }
-        }
-        let migration_lock =
-            DatabaseMigrationLock::acquire(PathBuf::from(format!("{url}.migration.lock"))).await?;
-        if !std::path::Path::new(url).exists() {
-            std::fs::File::create(url).ok();
-        }
-        let n: usize = std::env::var("MAX_DATABASE_CONNECTIONS")
+            if !path.exists() {
+                std::fs::File::create(&path)?;
+            }
+            Some(
+                DatabaseMigrationLock::acquire(PathBuf::from(format!(
+                    "{}.migration.lock",
+                    path.display()
+                )))
+                .await?,
+            )
+        } else {
+            None
+        };
+        let configured_connections: usize = std::env::var("MAX_DATABASE_CONNECTIONS")
             .unwrap_or_else(|_| "1".to_owned())
             .parse()
             .unwrap_or(1);
+        let n = match backend {
+            DatabaseBackend::Sqlite => {
+                if configured_connections != 1 {
+                    log::warn!("SQLite 强制使用单数据库连接，忽略 MAX_DATABASE_CONNECTIONS={configured_connections}");
+                }
+                1
+            }
+            DatabaseBackend::PostgreSql => configured_connections.max(1),
+        };
         log::debug!("MAX_DATABASE_CONNECTIONS={}", n);
         let pool = Pool::new(
             DbPool {
-                url: url.to_owned(),
+                url: connection_url,
+                backend,
             },
             n,
         );
         let mut conn = pool.get().await?;
         log::warn!("数据库 schema 升级要求停止全部旧版服务端写进程；不支持新旧二进制滚动混跑");
         log::info!("Running database migrations...");
-        sqlx::migrate!().run(conn.deref_mut()).await?;
+        match backend {
+            DatabaseBackend::Sqlite => sqlx::migrate!().run(conn.deref_mut()).await?,
+            DatabaseBackend::PostgreSql => {
+                sqlx::migrate!("./migrations/postgres")
+                    .run(conn.deref_mut())
+                    .await?
+            }
+        }
         let mut tx = conn.begin().await?;
         inventory::lock_inventory(&mut tx)
             .await
             .map_err(|error| hbb_common::anyhow::anyhow!(error.to_string()))?;
-        ensure_users_token_version_column(&mut tx).await?;
-        migrate_legacy_peer_if_exists(&mut tx).await?;
-        verify_inventory_integrity(&mut tx).await?;
-        addressbook::initialize_address_book(&mut tx).await?;
+        if backend == DatabaseBackend::Sqlite {
+            ensure_users_token_version_column(&mut tx).await?;
+            migrate_legacy_peer_if_exists(&mut tx).await?;
+            verify_inventory_integrity(&mut tx).await?;
+        }
+        addressbook::initialize_address_book(&mut tx, backend).await?;
         tx.commit().await?;
         log::info!("Database migrations complete");
         drop(conn);
@@ -317,8 +505,21 @@ impl Database {
         let db = Database {
             pool,
             auth_cache_scope,
+            backend,
         };
         Ok(db)
+    }
+
+    pub fn backend(&self) -> DatabaseBackend {
+        self.backend
+    }
+
+    pub async fn health_check(&self) -> ResultType<()> {
+        let mut connection = self.pool.get().await?;
+        sqlx::query("SELECT 1")
+            .execute(connection.deref_mut())
+            .await?;
+        Ok(())
     }
 
     pub fn auth_cache_scope(&self) -> u64 {
@@ -348,7 +549,7 @@ impl Database {
     }
 
     pub async fn get_peer(&self, id: &str) -> ResultType<Option<Peer>> {
-        let sql = format!("SELECT {DEVICE_COLUMNS} FROM devices WHERE device_id = ?");
+        let sql = format!("SELECT {DEVICE_COLUMNS} FROM devices WHERE device_id = $1");
         Ok(sqlx::query_as::<_, Peer>(&sql)
             .bind(id)
             .fetch_optional(self.pool.get().await?.deref_mut())
@@ -357,7 +558,7 @@ impl Database {
 
     pub async fn get_peer_for_rendezvous(&self, id: &str) -> ResultType<Option<Peer>> {
         let sql = format!(
-            "SELECT {DEVICE_COLUMNS} FROM devices WHERE device_id = ? AND status IN ('online', 'offline')"
+            "SELECT {DEVICE_COLUMNS} FROM devices WHERE device_id = $1 AND status IN ('online', 'offline')"
         );
         Ok(sqlx::query_as::<_, Peer>(&sql)
             .bind(id)
@@ -373,14 +574,16 @@ impl Database {
         info: &str,
     ) -> ResultType<Vec<u8>> {
         let guid = uuid::Uuid::new_v4().as_bytes().to_vec();
-        sqlx::query("INSERT INTO devices(guid, device_id, uuid, pk, info) VALUES(?, ?, ?, ?, ?)")
-            .bind(&guid)
-            .bind(id)
-            .bind(uuid)
-            .bind(pk)
-            .bind(info)
-            .execute(self.pool.get().await?.deref_mut())
-            .await?;
+        sqlx::query(
+            "INSERT INTO devices(guid, device_id, uuid, pk, info) VALUES($1, $2, $3, $4, $5)",
+        )
+        .bind(&guid)
+        .bind(id)
+        .bind(uuid)
+        .bind(pk)
+        .bind(info)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
         Ok(guid)
     }
 
@@ -396,11 +599,11 @@ impl Database {
         inventory::lock_inventory(&mut tx)
             .await
             .map_err(|error| hbb_common::anyhow::anyhow!(error.to_string()))?;
-        let current = sqlx::query("SELECT id, device_id FROM devices WHERE guid = ?")
+        let current = sqlx::query("SELECT id, device_id FROM devices WHERE guid = $1")
             .bind(guid)
             .fetch_optional(&mut tx)
             .await?;
-        sqlx::query("UPDATE devices SET device_id=?, pk=?, info=? WHERE guid=?")
+        sqlx::query("UPDATE devices SET device_id=$1, pk=$2, info=$3 WHERE guid=$4")
             .bind(id)
             .bind(pk)
             .bind(info)
@@ -520,10 +723,10 @@ impl Database {
         if let Some(peer) = existing.as_ref() {
             sqlx::query(
                 "UPDATE devices
-                 SET pk = ?, info = ?, status = 'online', last_seen = current_timestamp,
-                     is_online = 1, last_online_at = current_timestamp,
+                 SET pk = $1, info = $2, status = 'online', last_seen = current_timestamp,
+                     is_online = TRUE, last_online_at = current_timestamp,
                      updated_at = current_timestamp
-                 WHERE guid = ?",
+                 WHERE guid = $3",
             )
             .bind(pk)
             .bind(info)
@@ -536,7 +739,7 @@ impl Database {
                 "INSERT INTO devices(
                     guid, device_id, uuid, pk, info, status, last_seen,
                     is_online, last_online_at, updated_at
-                 ) VALUES(?, ?, ?, ?, ?, 'online', current_timestamp, 1, current_timestamp, current_timestamp)",
+                 ) VALUES($1, $2, $3, $4, $5, 'online', current_timestamp, 1, current_timestamp, current_timestamp)",
             )
             .bind(guid)
             .bind(id)
@@ -562,9 +765,9 @@ impl Database {
     pub async fn touch_admitted_device(&self, id: &str, expected_guid: &[u8]) -> ResultType<bool> {
         let affected = sqlx::query(
             "UPDATE devices
-             SET status = 'online', last_seen = current_timestamp, is_online = 1,
+             SET status = 'online', last_seen = current_timestamp, is_online = TRUE,
                  last_online_at = current_timestamp, updated_at = current_timestamp
-             WHERE device_id = ? AND guid = ? AND status IN ('online', 'offline')",
+             WHERE device_id = $1 AND guid = $2 AND status IN ('online', 'offline')",
         )
         .bind(id)
         .bind(expected_guid)
@@ -576,7 +779,7 @@ impl Database {
     pub async fn mark_startup_online_offline(&self) -> ResultType<u64> {
         let affected = sqlx::query(
             "UPDATE devices
-             SET status = 'offline', is_online = 0, updated_at = current_timestamp
+             SET status = 'offline', is_online = FALSE, updated_at = current_timestamp
              WHERE status = 'online'",
         )
         .execute(self.pool.get().await?.deref_mut())
@@ -592,8 +795,8 @@ impl Database {
     async fn mark_stale_online_offline_at(&self, cutoff: NaiveDateTime) -> ResultType<Vec<String>> {
         let rows = sqlx::query(
             "UPDATE devices
-             SET status = 'offline', is_online = 0, updated_at = current_timestamp
-             WHERE status = 'online' AND last_seen < ?
+             SET status = 'offline', is_online = FALSE, updated_at = current_timestamp
+             WHERE status = 'online' AND last_seen < $1
              RETURNING device_id",
         )
         .bind(cutoff)
@@ -618,8 +821,8 @@ impl Database {
         lock_device_quota(&mut tx).await?;
         let rows = sqlx::query(
             "UPDATE devices
-             SET status = 'inactive', is_online = 0, updated_at = current_timestamp
-             WHERE status = 'offline' AND last_seen < ?
+             SET status = 'inactive', is_online = FALSE, updated_at = current_timestamp
+             WHERE status = 'offline' AND last_seen < $1
              RETURNING device_id",
         )
         .bind(cutoff)
@@ -637,7 +840,7 @@ impl Database {
         let mut conn = self.pool.get().await?;
         let mut tx = conn.begin().await?;
         lock_device_quota(&mut tx).await?;
-        let status = sqlx::query("SELECT status FROM devices WHERE device_id = ?")
+        let status = sqlx::query("SELECT status FROM devices WHERE device_id = $1")
             .bind(id)
             .fetch_optional(&mut tx)
             .await?
@@ -649,8 +852,8 @@ impl Database {
             Some(_) => {
                 sqlx::query(
                     "UPDATE devices
-                     SET status = 'inactive', is_online = 0, updated_at = current_timestamp
-                     WHERE device_id = ?",
+                     SET status = 'inactive', is_online = FALSE, updated_at = current_timestamp
+                     WHERE device_id = $1",
                 )
                 .bind(id)
                 .execute(&mut tx)
@@ -663,7 +866,7 @@ impl Database {
     }
 
     pub async fn is_device_inactive(&self, id: &str) -> ResultType<bool> {
-        let row = sqlx::query("SELECT status FROM devices WHERE device_id = ?")
+        let row = sqlx::query("SELECT status FROM devices WHERE device_id = $1")
             .bind(id)
             .fetch_optional(self.pool.get().await?.deref_mut())
             .await?;
@@ -705,7 +908,7 @@ impl Database {
         Ok(sqlx::query_as::<_, User>(
             "
             INSERT INTO users(username, password_hash, email, role)
-            VALUES(?, ?, ?, ?)
+            VALUES($1, $2, $3, $4)
             RETURNING id, username, password_hash, email, role, is_active, token_version, failed_login_count, locked_until, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
             ",
         )
@@ -721,7 +924,7 @@ impl Database {
         let result = sqlx::query(
             "
             INSERT INTO users(username, password_hash, email, role)
-            SELECT 'admin', ?, NULL, 'admin'
+            SELECT 'admin', $1, NULL, 'admin'
             WHERE NOT EXISTS (SELECT 1 FROM users)
             ",
         )
@@ -736,7 +939,7 @@ impl Database {
             "
             SELECT id, username, password_hash, email, role, is_active, token_version, failed_login_count, locked_until, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
             FROM users
-            WHERE id = ?
+            WHERE id = $1
             ",
         )
         .bind(id)
@@ -749,7 +952,7 @@ impl Database {
             "
             SELECT id, username, password_hash, email, role, is_active, token_version, failed_login_count, locked_until, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
             FROM users
-            WHERE username = ?
+            WHERE username = $1
             ",
         )
         .bind(username)
@@ -767,7 +970,7 @@ impl Database {
             SELECT id, username, password_hash, email, role, is_active, token_version, failed_login_count, locked_until, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
             FROM users
             ORDER BY id
-            LIMIT ? OFFSET ?
+            LIMIT $1 OFFSET $2
             ",
         )
         .bind(page_size)
@@ -780,7 +983,7 @@ impl Database {
     }
 
     pub async fn find_users_by_email(&self, email: &str) -> ResultType<Vec<User>> {
-        let sql = format!("SELECT {USER_COLUMNS} FROM users WHERE email = ?");
+        let sql = format!("SELECT {USER_COLUMNS} FROM users WHERE email = $1");
         Ok(sqlx::query_as::<_, User>(&sql)
             .bind(email)
             .fetch_all(self.pool.get().await?.deref_mut())
@@ -793,7 +996,7 @@ impl Database {
         subject: &str,
     ) -> ResultType<Option<User>> {
         let sql = format!(
-            "SELECT {USER_COLUMNS} FROM users WHERE oauth_provider = ? AND oauth_subject = ?"
+            "SELECT {USER_COLUMNS} FROM users WHERE oauth_provider = $1 AND oauth_subject = $2"
         );
         Ok(sqlx::query_as::<_, User>(&sql)
             .bind(provider)
@@ -812,7 +1015,7 @@ impl Database {
         Ok(sqlx::query_as::<_, User>(
             "
             INSERT INTO users(username, password_hash, email, role, oauth_provider, oauth_subject, last_login_at)
-            VALUES(?, '', ?, 'user', ?, ?, current_timestamp)
+            VALUES($1, '', $2, 'user', $3, $4, current_timestamp)
             RETURNING id, username, password_hash, email, role, is_active, token_version, failed_login_count, locked_until, oauth_provider, oauth_subject, last_login_at, created_at, updated_at
             ",
         )
@@ -833,8 +1036,8 @@ impl Database {
         let affected = sqlx::query(
             "
             UPDATE users
-            SET oauth_provider = ?, oauth_subject = ?, last_login_at = current_timestamp, updated_at = current_timestamp
-            WHERE id = ? AND (oauth_provider IS NULL OR oauth_provider = '')
+            SET oauth_provider = $1, oauth_subject = $2, last_login_at = current_timestamp, updated_at = current_timestamp
+            WHERE id = $3 AND (oauth_provider IS NULL OR oauth_provider = '')
             ",
         )
         .bind(provider)
@@ -855,7 +1058,7 @@ impl Database {
             "
             UPDATE users
             SET last_login_at = current_timestamp
-            WHERE id = ?
+            WHERE id = $1
             ",
         )
         .bind(user_id)
@@ -877,7 +1080,7 @@ impl Database {
                 locked_until = NULL,
                 last_login_at = current_timestamp,
                 updated_at = current_timestamp
-            WHERE id = ? AND is_active = 1
+            WHERE id = $1 AND is_active = TRUE
             "#,
         )
         .bind(user_id)
@@ -897,6 +1100,7 @@ impl Database {
         max_failures: u32,
         lock_minutes: u32,
     ) -> ResultType<LoginFailureState> {
+        let lock_until = Utc::now().naive_utc() + ChronoDuration::minutes(i64::from(lock_minutes));
         let row = sqlx::query(
             r#"
             UPDATE users
@@ -908,17 +1112,17 @@ impl Database {
                     WHEN (CASE
                         WHEN locked_until IS NOT NULL AND locked_until <= current_timestamp THEN 1
                         ELSE failed_login_count + 1
-                    END) >= ?
-                    THEN datetime(current_timestamp, printf('+%d minutes', ?))
+                    END) >= $1
+                    THEN $2
                     ELSE NULL
                 END,
                 updated_at = current_timestamp
-            WHERE id = ?
+            WHERE id = $3
             RETURNING failed_login_count, locked_until
             "#,
         )
         .bind(i64::from(max_failures))
-        .bind(i64::from(lock_minutes))
+        .bind(lock_until)
         .bind(user_id)
         .fetch_optional(self.pool.get().await?.deref_mut())
         .await?
@@ -942,36 +1146,48 @@ impl Database {
                 .ok_or_else(|| hbb_common::anyhow::anyhow!("user not found"));
         }
 
-        let mut query = sqlx::QueryBuilder::<Sqlite>::new("UPDATE users SET ");
-        let mut separated = query.separated(", ");
+        let mut query = PortableQuery::new("UPDATE users SET ");
+        let mut first = true;
         if let Some(email) = fields.email.as_ref() {
-            separated.push("email = ");
-            separated.push_bind(email);
+            query.push("email = ");
+            query.push_bind(email);
+            first = false;
         }
         if let Some(role) = fields.role.as_ref() {
-            separated.push("role = ");
-            separated.push_bind(role);
+            if !first {
+                query.push(", ");
+            }
+            query.push("role = ");
+            query.push_bind(role);
+            first = false;
         }
         if let Some(is_active) = fields.is_active {
-            separated.push("is_active = ");
-            separated.push_bind(is_active);
+            if !first {
+                query.push(", ");
+            }
+            query.push("is_active = ");
+            query.push_bind(is_active);
+            first = false;
         }
         if let Some(password_hash) = fields.password_hash.as_ref() {
-            separated.push("password_hash = ");
-            separated.push_bind(password_hash);
+            if !first {
+                query.push(", ");
+            }
+            query.push("password_hash = ");
+            query.push_bind(password_hash);
+            first = false;
         }
         if fields.increment_token_version {
-            separated.push("token_version = token_version + 1");
+            if !first {
+                query.push(", ");
+            }
+            query.push("token_version = token_version + 1");
         }
-        separated.push("updated_at = current_timestamp");
-        drop(separated);
+        query.push(", updated_at = current_timestamp");
         query.push(" WHERE id = ");
         query.push_bind(id);
 
-        let affected = query
-            .build()
-            .execute(self.pool.get().await?.deref_mut())
-            .await?;
+        let affected = query.execute(self.pool.get().await?.deref_mut()).await?;
         if affected.rows_affected() == 0 {
             bail!("user not found");
         }
@@ -990,8 +1206,8 @@ impl Database {
         let affected = sqlx::query(
             "
             UPDATE users
-            SET password_hash = ?, token_version = ?, updated_at = current_timestamp
-            WHERE id = ?
+            SET password_hash = $1, token_version = $2, updated_at = current_timestamp
+            WHERE id = $3
             ",
         )
         .bind(new_hash)
@@ -1010,7 +1226,7 @@ impl Database {
             "
             UPDATE users
             SET token_version = token_version + 1, updated_at = current_timestamp
-            WHERE id = ?
+            WHERE id = $1
             ",
         )
         .bind(id)
@@ -1026,8 +1242,8 @@ impl Database {
         let affected = sqlx::query(
             "
             UPDATE users
-            SET is_active = 0, token_version = token_version + 1, updated_at = current_timestamp
-            WHERE id = ?
+            SET is_active = FALSE, token_version = token_version + 1, updated_at = current_timestamp
+            WHERE id = $1
             ",
         )
         .bind(id)
@@ -1057,7 +1273,7 @@ impl Database {
         let mut conn = self.pool.get().await?;
         let mut tx = conn.begin().await?;
         lock_device_quota(&mut tx).await?;
-        sqlx::query("UPDATE licenses SET is_active = 0 WHERE is_active = 1")
+        sqlx::query("UPDATE licenses SET is_active = FALSE WHERE is_active = TRUE")
             .execute(&mut tx)
             .await?;
         let expires_at = expires_at
@@ -1066,12 +1282,12 @@ impl Database {
         sqlx::query(
             "
             INSERT INTO licenses(license_key, user_id, device_limit, expires_at, is_active, features)
-            VALUES(?, ?, ?, ?, 1, ?)
+            VALUES($1, $2, $3, $4, 1, $5)
             ON CONFLICT(license_key) DO UPDATE SET
                 user_id = excluded.user_id,
                 device_limit = excluded.device_limit,
                 expires_at = excluded.expires_at,
-                is_active = 1,
+                is_active = TRUE,
                 features = excluded.features
             ",
         )
@@ -1091,7 +1307,7 @@ impl Database {
             "
             SELECT license_key
             FROM licenses
-            WHERE is_active = 1
+            WHERE is_active = TRUE
             ORDER BY id DESC
             LIMIT 1
             ",
@@ -1109,7 +1325,7 @@ impl Database {
     }
 
     pub async fn get_user_token_version(&self, id: i64) -> ResultType<i64> {
-        let row = sqlx::query("SELECT token_version FROM users WHERE id = ?")
+        let row = sqlx::query("SELECT token_version FROM users WHERE id = $1")
             .bind(id)
             .fetch_optional(self.pool.get().await?.deref_mut())
             .await?;
@@ -1128,11 +1344,12 @@ impl Database {
         let mut tx = connection.begin().await?;
         sqlx::query(
             r#"
-            INSERT OR IGNORE INTO security_policies(
+            INSERT INTO security_policies(
                 id, password_min_length, password_require_number, password_require_symbol,
                 login_max_failures, login_lock_minutes, session_timeout_minutes,
                 allowed_admin_cidrs, audit_retention_days
-            ) VALUES(1, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES(1, $1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT(id) DO NOTHING
             "#,
         )
         .bind(i64::try_from(defaults.password_min_length)?)
@@ -1167,7 +1384,7 @@ impl Database {
                 id, password_min_length, password_require_number, password_require_symbol,
                 login_max_failures, login_lock_minutes, session_timeout_minutes,
                 allowed_admin_cidrs, audit_retention_days, updated_at
-            ) VALUES(1, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+            ) VALUES(1, $1, $2, $3, $4, $5, $6, $7, $8, current_timestamp)
             ON CONFLICT(id) DO UPDATE SET
                 password_min_length = excluded.password_min_length,
                 password_require_number = excluded.password_require_number,
@@ -1199,7 +1416,7 @@ impl Database {
             r#"
             INSERT INTO audit_logs(
                 user_id, action, resource_type, resource_id, detail, ip_address, created_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+            ) VALUES($1, $2, $3, $4, $5, $6, $7)
             "#,
         )
         .bind(event.user_id)
@@ -1229,13 +1446,13 @@ impl Database {
             SELECT id, user_id, action, resource_type AS target_type,
                    resource_id AS target_id, detail, ip_address, created_at
             FROM audit_logs
-            WHERE (? IS NULL OR action = ?)
-              AND (? IS NULL OR resource_type = ?)
-              AND (? IS NULL OR user_id = ?)
-              AND (? IS NULL OR created_at >= ?)
-              AND (? IS NULL OR created_at <= ?)
+            WHERE ($1 IS NULL OR action = $2)
+              AND ($3 IS NULL OR resource_type = $4)
+              AND ($5 IS NULL OR user_id = $6)
+              AND ($7 IS NULL OR created_at >= $8)
+              AND ($9 IS NULL OR created_at <= $10)
             ORDER BY created_at DESC, id DESC
-            LIMIT ? OFFSET ?
+            LIMIT $11 OFFSET $12
             "#,
         )
         .bind(filter.action.as_deref())
@@ -1256,11 +1473,11 @@ impl Database {
             r#"
             SELECT COUNT(*) AS count
             FROM audit_logs
-            WHERE (? IS NULL OR action = ?)
-              AND (? IS NULL OR resource_type = ?)
-              AND (? IS NULL OR user_id = ?)
-              AND (? IS NULL OR created_at >= ?)
-              AND (? IS NULL OR created_at <= ?)
+            WHERE ($1 IS NULL OR action = $2)
+              AND ($3 IS NULL OR resource_type = $4)
+              AND ($5 IS NULL OR user_id = $6)
+              AND ($7 IS NULL OR created_at >= $8)
+              AND ($9 IS NULL OR created_at <= $10)
             "#,
         )
         .bind(filter.action.as_deref())
@@ -1280,12 +1497,59 @@ impl Database {
     }
 
     pub async fn delete_expired_audit_logs(&self, retention_days: u32) -> ResultType<u64> {
-        let modifier = format!("-{} days", retention_days);
-        let result = sqlx::query("DELETE FROM audit_logs WHERE created_at < datetime('now', ?)")
-            .bind(modifier)
+        let cutoff = Utc::now().naive_utc() - ChronoDuration::days(i64::from(retention_days));
+        let result = sqlx::query("DELETE FROM audit_logs WHERE created_at < $1")
+            .bind(cutoff)
             .execute(self.pool.get().await?.deref_mut())
             .await?;
         Ok(result.rows_affected())
+    }
+}
+
+fn database_backend(url: &str) -> ResultType<DatabaseBackend> {
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        Ok(DatabaseBackend::PostgreSql)
+    } else if url.contains("://") && !url.starts_with("sqlite:") {
+        bail!("unsupported database URL scheme")
+    } else {
+        Ok(DatabaseBackend::Sqlite)
+    }
+}
+
+fn sqlite_path(locator: &str) -> ResultType<PathBuf> {
+    if !locator.starts_with("sqlite:") {
+        return Ok(PathBuf::from(locator));
+    }
+    let value = locator
+        .strip_prefix("sqlite://")
+        .or_else(|| locator.strip_prefix("sqlite:"))
+        .unwrap_or(locator)
+        .split('?')
+        .next()
+        .unwrap_or_default();
+    if value.is_empty() || value == ":memory:" {
+        bail!("SQLite database URL must reference a persistent file")
+    }
+    #[cfg(windows)]
+    let value = if value.starts_with('/') && value.as_bytes().get(2) == Some(&b':') {
+        &value[1..]
+    } else {
+        value
+    };
+    Ok(PathBuf::from(value))
+}
+
+fn normalize_database_url(url: &str, backend: DatabaseBackend) -> ResultType<String> {
+    if backend == DatabaseBackend::PostgreSql || url.starts_with("sqlite:") {
+        return Ok(url.to_string());
+    }
+    let normalized = Path::new(url).to_string_lossy().replace('\\', "/");
+    if normalized.starts_with('/') {
+        Ok(format!("sqlite://{normalized}"))
+    } else if normalized.as_bytes().get(1) == Some(&b':') {
+        Ok(format!("sqlite:///{normalized}"))
+    } else {
+        Ok(format!("sqlite://{normalized}"))
     }
 }
 
@@ -1302,24 +1566,24 @@ fn security_config_from_row(row: SecurityPolicyRow) -> ResultType<SecurityConfig
     })
 }
 
-async fn lock_device_quota(tx: &mut Transaction<'_, Sqlite>) -> ResultType<()> {
+async fn lock_device_quota(tx: &mut Transaction<'_, Any>) -> ResultType<()> {
     sqlx::query("UPDATE device_quota_lock SET version = version + 1 WHERE id = 1")
         .execute(&mut *tx)
         .await?;
     Ok(())
 }
 
-async fn fetch_peer_in_tx(tx: &mut Transaction<'_, Sqlite>, id: &str) -> ResultType<Option<Peer>> {
-    let sql = format!("SELECT {DEVICE_COLUMNS} FROM devices WHERE device_id = ?");
+async fn fetch_peer_in_tx(tx: &mut Transaction<'_, Any>, id: &str) -> ResultType<Option<Peer>> {
+    let sql = format!("SELECT {DEVICE_COLUMNS} FROM devices WHERE device_id = $1");
     Ok(sqlx::query_as::<_, Peer>(&sql)
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?)
 }
 
-async fn active_license_key_in_tx(tx: &mut Transaction<'_, Sqlite>) -> ResultType<Option<String>> {
+async fn active_license_key_in_tx(tx: &mut Transaction<'_, Any>) -> ResultType<Option<String>> {
     let row = sqlx::query(
-        "SELECT license_key FROM licenses WHERE is_active = 1 ORDER BY id DESC LIMIT 1",
+        "SELECT license_key FROM licenses WHERE is_active = TRUE ORDER BY id DESC LIMIT 1",
     )
     .fetch_optional(&mut *tx)
     .await?;
@@ -1328,7 +1592,7 @@ async fn active_license_key_in_tx(tx: &mut Transaction<'_, Sqlite>) -> ResultTyp
         .transpose()?)
 }
 
-async fn count_current_devices_in_tx(tx: &mut Transaction<'_, Sqlite>) -> ResultType<u32> {
+async fn count_current_devices_in_tx(tx: &mut Transaction<'_, Any>) -> ResultType<u32> {
     let row =
         sqlx::query("SELECT COUNT(*) AS count FROM devices WHERE status IN ('online', 'offline')")
             .fetch_one(&mut *tx)
@@ -1336,7 +1600,7 @@ async fn count_current_devices_in_tx(tx: &mut Transaction<'_, Sqlite>) -> Result
     Ok(row.try_get::<i64, _>("count")?.max(0) as u32)
 }
 
-async fn migrate_legacy_peer_if_exists(tx: &mut Transaction<'_, Sqlite>) -> ResultType<()> {
+async fn migrate_legacy_peer_if_exists(tx: &mut Transaction<'_, Any>) -> ResultType<()> {
     let peer_exists = fetch_count(
         tx,
         "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name='peer'",
@@ -1382,7 +1646,7 @@ async fn migrate_legacy_peer_if_exists(tx: &mut Transaction<'_, Sqlite>) -> Resu
     Ok(())
 }
 
-async fn ensure_users_token_version_column(tx: &mut Transaction<'_, Sqlite>) -> ResultType<()> {
+async fn ensure_users_token_version_column(tx: &mut Transaction<'_, Any>) -> ResultType<()> {
     let rows = sqlx::query("PRAGMA table_info(users)")
         .fetch_all(&mut *tx)
         .await?;
@@ -1400,7 +1664,7 @@ async fn ensure_users_token_version_column(tx: &mut Transaction<'_, Sqlite>) -> 
     Ok(())
 }
 
-async fn fetch_count(tx: &mut Transaction<'_, Sqlite>, sql: &str) -> ResultType<i64> {
+async fn fetch_count(tx: &mut Transaction<'_, Any>, sql: &str) -> ResultType<i64> {
     let row = sqlx::query(sql).fetch_one(&mut *tx).await?;
     Ok(row.try_get::<i64, _>("count")?)
 }
@@ -1409,12 +1673,140 @@ async fn fetch_count(tx: &mut Transaction<'_, Sqlite>, sql: &str) -> ResultType<
 mod tests {
     use super::*;
     use hbb_common::tokio;
-    use sqlx::{migrate::Migrate, Connection, Executor, SqliteConnection};
+    use sqlx::{migrate::Migrate, AnyConnection, Connection, Executor, SqliteConnection};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const TEST_GUID: &[u8] = b"guid-binary-0001";
     const TEST_UUID: &[u8] = b"uuid-binary-0001";
     const TEST_PK: &[u8] = b"pk-binary-0001";
+
+    #[test]
+    fn postgres_runtime_smoke_when_configured() {
+        let Ok(url) = std::env::var("TEST_POSTGRES_URL") else {
+            return;
+        };
+        run(async {
+            let db = Database::new(&url).await.unwrap();
+            assert_eq!(db.backend(), DatabaseBackend::PostgreSql);
+            db.health_check().await.unwrap();
+            let username = format!("pg-smoke-{}", uuid::Uuid::new_v4().simple());
+            let user = db
+                .create_user(&username, "test-hash", None, "admin")
+                .await
+                .unwrap();
+            assert_eq!(
+                db.find_user_by_username(&username)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                user.id
+            );
+            let group = db
+                .create_group(OwnerScope::All, user.id, "PostgreSQL smoke", None)
+                .await
+                .unwrap();
+            assert_eq!(group.owner_user_id, user.id);
+            let child = db
+                .create_group(OwnerScope::All, user.id, "PostgreSQL child", Some(group.id))
+                .await
+                .unwrap();
+            assert!(matches!(
+                db.delete_group(OwnerScope::All, group.id).await.unwrap(),
+                GroupDeleteOutcome::NotEmpty
+            ));
+            let cycle_error = sqlx::query("UPDATE groups SET parent_group_id = $1 WHERE id = $2")
+                .bind(child.id)
+                .bind(group.id)
+                .execute(db.pool.get().await.unwrap().deref_mut())
+                .await
+                .unwrap_err();
+            assert!(cycle_error.to_string().contains("group_cycle"));
+            let other = db
+                .create_user(
+                    &format!("pg-smoke-other-{}", uuid::Uuid::new_v4().simple()),
+                    "test-hash",
+                    None,
+                    "user",
+                )
+                .await
+                .unwrap();
+            let tag_id = sqlx::query_scalar::<_, i64>(
+                "INSERT INTO tags(owner_user_id, name) VALUES($1, $2) RETURNING id",
+            )
+            .bind(user.id)
+            .bind(format!("pg-tag-{}", uuid::Uuid::new_v4().simple()))
+            .fetch_one(db.pool.get().await.unwrap().deref_mut())
+            .await
+            .unwrap();
+            let tag_owner_error = sqlx::query("UPDATE tags SET owner_user_id = $1 WHERE id = $2")
+                .bind(other.id)
+                .bind(tag_id)
+                .execute(db.pool.get().await.unwrap().deref_mut())
+                .await
+                .unwrap_err();
+            assert!(tag_owner_error.to_string().contains("tag_owner_immutable"));
+            let updated = db
+                .update_user(
+                    user.id,
+                    UpdateUserFields {
+                        email: Some("pg-smoke@example.com".to_string()),
+                        increment_token_version: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(updated.token_version, 1);
+            let failure = db.record_login_failure(user.id, 1, 5).await.unwrap();
+            assert!(failure.locked_until.is_some());
+            assert_eq!(
+                db.load_or_create_security_policy(&SecurityConfig::default())
+                    .await
+                    .unwrap(),
+                SecurityConfig::default()
+            );
+            let device_id = format!("pg-device-{}", uuid::Uuid::new_v4().simple());
+            db.insert_peer(&device_id, TEST_UUID, TEST_PK, r#"{"ip":"127.0.0.1"}"#)
+                .await
+                .unwrap();
+            db.update_managed_device(
+                OwnerScope::All,
+                &device_id,
+                &DeviceUpdate {
+                    alias: Some(Some("PostgreSQL 设备".to_string())),
+                    group_id: Some(Some(group.id)),
+                    owner_user_id: Some(Some(user.id)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let (devices, total) = db
+                .list_managed_devices(
+                    OwnerScope::Owner(user.id),
+                    &DeviceListFilter {
+                        query: Some("postgresql".to_string()),
+                        page: 1,
+                        page_size: 20,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(total >= 1);
+            assert!(devices.iter().any(|device| device.device_id == device_id));
+            let address_book = db
+                .get_address_book_full(user.id, 1, 20, None)
+                .await
+                .unwrap();
+            assert!(address_book
+                .items
+                .iter()
+                .any(|item| item.device_id == device_id));
+        });
+    }
 
     #[test]
     fn create_user_enforces_username_boundary() {
@@ -1594,7 +1986,7 @@ mod tests {
             let mut writer_tx = writer.begin().await.unwrap();
             sqlx::query(
                 "INSERT INTO peer(guid, id, uuid, pk, note, info)
-                 VALUES(?, ?, ?, ?, ?, ?)",
+                 VALUES($1, $2, $3, $4, $5, $6)",
             )
             .bind(TEST_GUID)
             .bind("online-writer-device")
@@ -1730,7 +2122,7 @@ mod tests {
                          guid, uuid, pk, device_id, owner_user_id,
                          device_name, os, alias, info
                      )
-                     VALUES(?, ?, ?, 'legacy-device', ?, ?, ?, ?, '{}')",
+                     VALUES($1, $2, $3, 'legacy-device', $4, $5, $6, $7, '{}')",
                 )
                 .bind(TEST_GUID)
                 .bind(TEST_UUID)
@@ -1818,7 +2210,7 @@ mod tests {
             let db = Database::new(&path).await.unwrap();
             let mut conn = db.pool.get().await.unwrap();
             let row = sqlx::query(
-                "SELECT typeof(guid) AS guid_type, typeof(uuid) AS uuid_type, typeof(pk) AS pk_type FROM devices WHERE device_id = ?",
+                "SELECT typeof(guid) AS guid_type, typeof(uuid) AS uuid_type, typeof(pk) AS pk_type FROM devices WHERE device_id = $1",
             )
             .bind("device-blob")
             .fetch_one(conn.deref_mut())
@@ -1882,18 +2274,18 @@ mod tests {
             assert!(err.to_string().contains("NOT NULL") || err.to_string().contains("pk"));
 
             let mut conn = connect(&path).await.unwrap();
-            assert!(raw_table_exists(&mut conn, "peer").await.unwrap());
-            assert!(!raw_table_exists(&mut conn, "peer_backup_legacy")
+            assert!(raw_sqlite_table_exists(&mut conn, "peer").await.unwrap());
+            assert!(!raw_sqlite_table_exists(&mut conn, "peer_backup_legacy")
                 .await
                 .unwrap());
             assert_eq!(
-                raw_count(&mut conn, "SELECT COUNT(*) AS count FROM peer")
+                raw_sqlite_count(&mut conn, "SELECT COUNT(*) AS count FROM peer")
                     .await
                     .unwrap(),
                 1
             );
             assert_eq!(
-                raw_count(&mut conn, "SELECT COUNT(*) AS count FROM devices")
+                raw_sqlite_count(&mut conn, "SELECT COUNT(*) AS count FROM devices")
                     .await
                     .unwrap(),
                 0
@@ -2008,7 +2400,7 @@ mod tests {
             .unwrap();
             sqlx::query(
                 "INSERT INTO devices(guid, uuid, pk, device_id, info, is_online)
-                 VALUES(?, ?, ?, 'historical-device', '{}', 1)",
+                 VALUES($1, $2, $3, 'historical-device', '{}', 1)",
             )
             .bind(TEST_GUID)
             .bind(TEST_UUID)
@@ -2040,7 +2432,7 @@ mod tests {
             .execute(&mut conn)
             .await;
             assert!(invalid.is_err());
-            let index_count = raw_count(
+            let index_count = raw_sqlite_count(
                 &mut conn,
                 "SELECT COUNT(*) AS count FROM sqlite_master
                  WHERE type='index' AND name='idx_devices_status_last_seen'",
@@ -2076,7 +2468,7 @@ mod tests {
             assert_eq!(db.device_usage().await.unwrap().current(), 1);
 
             sqlx::query(
-                "UPDATE devices SET status='online', is_online=1 WHERE device_id='online-device'",
+                "UPDATE devices SET status='online', is_online = TRUE WHERE device_id='online-device'",
             )
             .execute(db.pool.get().await.unwrap().deref_mut())
             .await
@@ -2109,7 +2501,7 @@ mod tests {
                 })
             ));
 
-            sqlx::query("UPDATE licenses SET is_active=0")
+            sqlx::query("UPDATE licenses SET is_active = FALSE")
                 .execute(db.pool.get().await.unwrap().deref_mut())
                 .await
                 .unwrap();
@@ -2131,7 +2523,7 @@ mod tests {
                 })
             ));
             db.set_device_inactive("device-two").await.unwrap();
-            sqlx::query("UPDATE licenses SET is_active=0")
+            sqlx::query("UPDATE licenses SET is_active = FALSE")
                 .execute(db.pool.get().await.unwrap().deref_mut())
                 .await
                 .unwrap();
@@ -2399,7 +2791,7 @@ mod tests {
         sqlx::query(
             "
             INSERT INTO peer(guid, id, uuid, pk, note, info)
-            VALUES(?, ?, ?, ?, ?, ?)
+            VALUES($1, $2, $3, $4, $5, $6)
             ",
         )
         .bind(TEST_GUID)
@@ -2418,7 +2810,7 @@ mod tests {
         sqlx::query(
             "
             INSERT INTO peer(guid, id, uuid, pk, note, info)
-            VALUES(?, ?, ?, NULL, ?, ?)
+            VALUES($1, $2, $3, NULL, $4, $5)
             ",
         )
         .bind(TEST_GUID)
@@ -2438,7 +2830,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO devices(
                 guid, uuid, pk, device_id, info, status, last_seen, is_online
-             ) VALUES(?, ?, ?, ?, '{}', ?, datetime('now', ?), ?)",
+             ) VALUES($1, $2, $3, $4, '{}', $5, datetime('now', $6), $7)",
         )
         .bind(guid)
         .bind(uuid.as_bytes())
@@ -2453,7 +2845,7 @@ mod tests {
     }
 
     async fn set_last_seen_age(db: &Database, id: &str, age_seconds: i64) {
-        sqlx::query("UPDATE devices SET last_seen=datetime('now', ?) WHERE device_id=?")
+        sqlx::query("UPDATE devices SET last_seen=datetime('now', $1) WHERE device_id=$2")
             .bind(format!("-{age_seconds} seconds"))
             .bind(id)
             .execute(db.pool.get().await.unwrap().deref_mut())
@@ -2464,14 +2856,14 @@ mod tests {
     async fn insert_test_license(db: &Database, max_devices: u32) {
         let key = format!("TEST-{max_devices}");
         let mut conn = db.pool.get().await.unwrap();
-        sqlx::query("UPDATE licenses SET is_active=0")
+        sqlx::query("UPDATE licenses SET is_active = FALSE")
             .execute(conn.deref_mut())
             .await
             .unwrap();
         sqlx::query(
             "INSERT INTO licenses(license_key, device_limit, is_active)
-             VALUES(?, ?, 1)
-             ON CONFLICT(license_key) DO UPDATE SET device_limit=excluded.device_limit, is_active=1",
+             VALUES($1, $2, 1)
+             ON CONFLICT(license_key) DO UPDATE SET device_limit=excluded.device_limit, is_active = TRUE",
         )
         .bind(key)
         .bind(i64::from(max_devices))
@@ -2525,7 +2917,7 @@ mod tests {
     async fn index_exists(db: &Database, index: &str) -> ResultType<bool> {
         let mut conn = db.pool.get().await?;
         let row = sqlx::query(
-            "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='index' AND name=?",
+            "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='index' AND name=$1",
         )
         .bind(index)
         .fetch_one(conn.deref_mut())
@@ -2536,7 +2928,7 @@ mod tests {
     async fn trigger_exists(db: &Database, trigger: &str) -> ResultType<bool> {
         let mut conn = db.pool.get().await?;
         let row = sqlx::query(
-            "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='trigger' AND name=?",
+            "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='trigger' AND name=$1",
         )
         .bind(trigger)
         .fetch_one(conn.deref_mut())
@@ -2553,9 +2945,19 @@ mod tests {
             .any(|row| row.try_get::<String, _>("name").ok().as_deref() == Some(column)))
     }
 
-    async fn raw_table_exists(conn: &mut SqliteConnection, table: &str) -> ResultType<bool> {
+    async fn raw_table_exists(conn: &mut AnyConnection, table: &str) -> ResultType<bool> {
         let row = sqlx::query(
-            "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name=?",
+            "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name=$1",
+        )
+        .bind(table)
+        .fetch_one(conn)
+        .await?;
+        Ok(row.try_get::<i64, _>("count")? > 0)
+    }
+
+    async fn raw_sqlite_table_exists(conn: &mut SqliteConnection, table: &str) -> ResultType<bool> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name=$1",
         )
         .bind(table)
         .fetch_one(conn)
@@ -2568,7 +2970,12 @@ mod tests {
         raw_count(conn.deref_mut(), sql).await.unwrap()
     }
 
-    async fn raw_count(conn: &mut SqliteConnection, sql: &str) -> ResultType<i64> {
+    async fn raw_count(conn: &mut AnyConnection, sql: &str) -> ResultType<i64> {
+        let row = sqlx::query(sql).fetch_one(conn).await?;
+        Ok(row.try_get::<i64, _>("count")?)
+    }
+
+    async fn raw_sqlite_count(conn: &mut SqliteConnection, sql: &str) -> ResultType<i64> {
         let row = sqlx::query(sql).fetch_one(conn).await?;
         Ok(row.try_get::<i64, _>("count")?)
     }

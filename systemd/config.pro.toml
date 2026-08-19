@@ -1,0 +1,47 @@
+[server]
+id_server = "0.0.0.0:21116"
+relay_server = "0.0.0.0:21117"
+api_server = "127.0.0.1:21114"
+key_file = "/var/lib/rustdesk-server/id_ed25519"
+db_path = "/var/lib/rustdesk-server/db_v2.sqlite3"
+# PostgreSQL 模式通过环境文件中的 RUSTDESK_SERVER__DATABASE_URL 注入。
+
+[rendezvous]
+servers = []
+
+[pro]
+enabled = true
+# 必须通过环境文件中的 RUSTDESK_PRO__JWT_SECRET 注入；此处故意省略该字段。
+jwt_expiry_hours = 24
+refresh_expiry_days = 7
+
+[pro.oidc]
+enabled = false
+
+[pro.security]
+password_min_length = 12
+password_require_number = true
+password_require_symbol = true
+login_max_failures = 5
+login_lock_minutes = 15
+session_timeout_minutes = 1440
+allowed_admin_cidrs = []
+audit_retention_days = 180
+
+[api_rate_limit]
+max_in_flight = 1024
+telemetry_max_in_flight = 768
+auth_max_in_flight = 64
+argon2_max_in_flight = 8
+request_timeout_ms = 10000
+telemetry_peer_capacity = 36000
+telemetry_peer_refill_per_minute = 18000
+auth_peer_capacity = 60
+auth_peer_refill_per_minute = 30
+device_capacity = 120
+device_refill_per_minute = 60
+address_book_actor_capacity = 30
+address_book_actor_refill_per_minute = 15
+peer_lru_capacity = 10000
+device_lru_capacity = 100000
+actor_lru_capacity = 100000

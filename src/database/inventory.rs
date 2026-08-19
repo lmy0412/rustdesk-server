@@ -2,12 +2,12 @@ use super::{
     addressbook::{
         delete_device_memberships_in_tx, upsert_device_memberships_in_tx, AddressBookError,
     },
-    Database,
+    Database, PortableQuery,
 };
 use crate::models::device::{DeviceSortBy, SortDirection};
-use chrono::NaiveDateTime;
+use chrono::{Duration as ChronoDuration, NaiveDateTime, Utc};
 use hbb_common::{bail, ResultType};
-use sqlx::{Connection, FromRow, QueryBuilder, Row, Sqlite, Transaction};
+use sqlx::{Any, Connection, FromRow, Row, Transaction};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
@@ -322,14 +322,14 @@ fn scope_allows_owner(scope: OwnerScope, owner_user_id: Option<i64>) -> bool {
     }
 }
 
-pub(super) async fn lock_inventory(tx: &mut Transaction<'_, Sqlite>) -> InventoryResult<()> {
+pub(super) async fn lock_inventory(tx: &mut Transaction<'_, Any>) -> InventoryResult<()> {
     sqlx::query("UPDATE inventory_write_lock SET version = version + 1 WHERE id = 1")
         .execute(&mut *tx)
         .await?;
     Ok(())
 }
 
-async fn lock_quota_then_inventory(tx: &mut Transaction<'_, Sqlite>) -> InventoryResult<()> {
+async fn lock_quota_then_inventory(tx: &mut Transaction<'_, Any>) -> InventoryResult<()> {
     sqlx::query("UPDATE device_quota_lock SET version = version + 1 WHERE id = 1")
         .execute(&mut *tx)
         .await?;
@@ -337,7 +337,7 @@ async fn lock_quota_then_inventory(tx: &mut Transaction<'_, Sqlite>) -> Inventor
 }
 
 async fn fetch_group_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     scope: OwnerScope,
     id: i64,
 ) -> InventoryResult<Option<GroupRecord>> {
@@ -345,7 +345,7 @@ async fn fetch_group_in_tx(
         OwnerScope::All => {
             sqlx::query_as::<_, GroupRecord>(
                 "SELECT id, name, owner_user_id, parent_group_id, created_at, updated_at
-                 FROM groups WHERE id = ?",
+                 FROM groups WHERE id = $1",
             )
             .bind(id)
             .fetch_optional(&mut *tx)
@@ -354,7 +354,7 @@ async fn fetch_group_in_tx(
         OwnerScope::Owner(owner_user_id) => {
             sqlx::query_as::<_, GroupRecord>(
                 "SELECT id, name, owner_user_id, parent_group_id, created_at, updated_at
-                 FROM groups WHERE id = ? AND owner_user_id = ?",
+                 FROM groups WHERE id = $1 AND owner_user_id = $2",
             )
             .bind(id)
             .bind(owner_user_id)
@@ -366,11 +366,11 @@ async fn fetch_group_in_tx(
 }
 
 async fn count_group_subtree_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     scope: OwnerScope,
     id: i64,
 ) -> InventoryResult<i64> {
-    let mut query = QueryBuilder::<Sqlite>::new(
+    let mut query = PortableQuery::new(
         "WITH RECURSIVE subtree(id) AS (
              SELECT id FROM groups WHERE id = ",
     );
@@ -391,18 +391,17 @@ async fn count_group_subtree_in_tx(
     query.push_bind(MAX_GROUP_TREE_NODES + 1);
     query.push(")");
     Ok(query
-        .build()
         .fetch_one(&mut *tx)
         .await?
         .try_get::<i64, _>("count")?)
 }
 
 async fn fetch_group_subtree_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     scope: OwnerScope,
     id: i64,
 ) -> InventoryResult<Vec<GroupRecord>> {
-    let mut query = QueryBuilder::<Sqlite>::new(
+    let mut query = PortableQuery::new(
         "WITH RECURSIVE subtree(id) AS (
              SELECT id FROM groups WHERE id = ",
     );
@@ -421,10 +420,9 @@ async fn fetch_group_subtree_in_tx(
                 grouped.parent_group_id, grouped.created_at, grouped.updated_at
          FROM groups grouped
          JOIN subtree ON subtree.id = grouped.id
-         ORDER BY grouped.name COLLATE NOCASE, grouped.id",
+         ORDER BY lower(grouped.name), grouped.id",
     );
     Ok(query
-        .build()
         .fetch_all(&mut *tx)
         .await?
         .iter()
@@ -446,12 +444,13 @@ impl Database {
         let mut connection = self.pool.get().await.map_err(pool_error)?;
         let mut tx = connection.begin().await?;
         lock_inventory(&mut tx).await?;
-        let owner_exists =
-            sqlx::query_scalar::<_, i64>("SELECT 1 FROM users WHERE id = ? AND is_active = 1")
-                .bind(owner_user_id)
-                .fetch_optional(&mut tx)
-                .await?
-                .is_some();
+        let owner_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT CAST(1 AS BIGINT) FROM users WHERE id = $1 AND is_active = TRUE",
+        )
+        .bind(owner_user_id)
+        .fetch_optional(&mut tx)
+        .await?
+        .is_some();
         if !owner_exists {
             return Err(InventoryError::NotFound);
         }
@@ -473,7 +472,7 @@ impl Database {
         }
         let group = sqlx::query_as::<_, GroupRecord>(
             "INSERT INTO groups(name, owner_user_id, parent_group_id)
-             VALUES(?, ?, ?)
+             VALUES($1, $2, $3)
              RETURNING id, name, owner_user_id, parent_group_id, created_at, updated_at",
         )
         .bind(name)
@@ -492,7 +491,7 @@ impl Database {
                 sqlx::query_as::<_, GroupRecord>(
                     "SELECT id, name, owner_user_id, parent_group_id, created_at, updated_at
                      FROM groups
-                     ORDER BY owner_user_id, name COLLATE NOCASE, id
+                     ORDER BY owner_user_id, lower(name), id
                      LIMIT 10001",
                 )
                 .fetch_all(connection.deref_mut())
@@ -502,8 +501,8 @@ impl Database {
                 sqlx::query_as::<_, GroupRecord>(
                     "SELECT id, name, owner_user_id, parent_group_id, created_at, updated_at
                      FROM groups
-                     WHERE owner_user_id = ?
-                     ORDER BY name COLLATE NOCASE, id
+                     WHERE owner_user_id = $1
+                     ORDER BY lower(name), id
                      LIMIT 10001",
                 )
                 .bind(owner_user_id)
@@ -578,8 +577,8 @@ impl Database {
         }
         sqlx::query(
             "UPDATE groups
-             SET name = ?, parent_group_id = ?, updated_at = current_timestamp
-             WHERE id = ?",
+             SET name = $1, parent_group_id = $2, updated_at = current_timestamp
+             WHERE id = $3",
         )
         .bind(name)
         .bind(parent_group_id)
@@ -607,21 +606,20 @@ impl Database {
             return Ok(GroupDeleteOutcome::NotFound);
         }
         let non_empty = sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS(
-                 SELECT 1 FROM groups WHERE parent_group_id = ?
-                 UNION ALL
-                 SELECT 1 FROM devices WHERE group_id = ?
-             )",
+            "SELECT CAST(1 AS BIGINT) FROM groups WHERE parent_group_id = $1
+             UNION ALL
+             SELECT CAST(1 AS BIGINT) FROM devices WHERE group_id = $2
+             LIMIT 1",
         )
         .bind(id)
         .bind(id)
-        .fetch_one(&mut tx)
+        .fetch_optional(&mut tx)
         .await?
-            != 0;
+        .is_some();
         if non_empty {
             return Ok(GroupDeleteOutcome::NotEmpty);
         }
-        sqlx::query("DELETE FROM groups WHERE id = ?")
+        sqlx::query("DELETE FROM groups WHERE id = $1")
             .bind(id)
             .execute(&mut tx)
             .await?;
@@ -646,7 +644,7 @@ impl Database {
         }
         let ungrouped_devices = sqlx::query(
             "WITH RECURSIVE subtree(id) AS (
-                 SELECT ?
+                 SELECT $1
                  UNION
                  SELECT child.id
                  FROM groups child
@@ -662,7 +660,7 @@ impl Database {
         .rows_affected();
         let deleted_groups = sqlx::query(
             "WITH RECURSIVE subtree(id) AS (
-                 SELECT ?
+                 SELECT $1
                  UNION
                  SELECT child.id
                  FROM groups child
@@ -721,15 +719,10 @@ impl Database {
         let Some(group) = fetch_group_in_tx(&mut tx, scope, group_id).await? else {
             return Err(InventoryError::NotFound);
         };
-        let mut query = QueryBuilder::<Sqlite>::new(
+        let mut query = PortableQuery::new(
             "SELECT device_id, owner_user_id, group_id FROM devices WHERE device_id IN (",
         );
-        {
-            let mut separated = query.separated(", ");
-            for device_id in &unique_ids {
-                separated.push_bind(device_id);
-            }
-        }
+        query.push_bind_list(&unique_ids);
         query.push(")");
         match scope {
             OwnerScope::All => {}
@@ -738,7 +731,7 @@ impl Database {
                 query.push_bind(owner_user_id);
             }
         }
-        let rows = query.build().fetch_all(&mut tx).await?;
+        let rows = query.fetch_all(&mut *tx).await?;
         if rows.len() != unique_ids.len() {
             return Err(InventoryError::NotFound);
         }
@@ -756,19 +749,14 @@ impl Database {
                 }
             }
         }
-        let mut update = QueryBuilder::<Sqlite>::new("UPDATE devices SET group_id = ");
+        let mut update = PortableQuery::new("UPDATE devices SET group_id = ");
         if add {
             update.push_bind(group_id);
         } else {
             update.push("NULL");
         }
         update.push(", updated_at = current_timestamp WHERE device_id IN (");
-        {
-            let mut separated = update.separated(", ");
-            for device_id in &unique_ids {
-                separated.push_bind(device_id);
-            }
-        }
+        update.push_bind_list(&unique_ids);
         update.push(")");
         if add {
             update.push(" AND group_id IS NOT ");
@@ -777,7 +765,7 @@ impl Database {
             update.push(" AND group_id = ");
             update.push_bind(group_id);
         }
-        let changed = update.build().execute(&mut tx).await?.rows_affected();
+        let changed = update.execute(&mut *tx).await?.rows_affected();
         tx.commit().await?;
         Ok(GroupDeviceBatchOutcome {
             matched: unique_ids.len() as u64,
@@ -802,7 +790,7 @@ const MANAGED_DEVICE_COLUMNS: &str = "
     d.updated_at
 ";
 
-fn push_device_scope(query: &mut QueryBuilder<'_, Sqlite>, scope: OwnerScope) {
+fn push_device_scope(query: &mut PortableQuery, scope: OwnerScope) {
     if let OwnerScope::Owner(owner_user_id) = scope {
         query.push(" AND d.owner_user_id = ");
         query.push_bind(owner_user_id);
@@ -823,11 +811,7 @@ fn escape_like_literal(value: &str) -> String {
     escaped
 }
 
-fn push_device_filters<'a>(
-    query: &mut QueryBuilder<'a, Sqlite>,
-    scope: OwnerScope,
-    filter: &'a DeviceListFilter,
-) {
+fn push_device_filters(query: &mut PortableQuery, scope: OwnerScope, filter: &DeviceListFilter) {
     push_device_scope(query, scope);
     if let Some(group_id) = filter.group_id {
         query.push(" AND d.group_id = ");
@@ -844,35 +828,31 @@ fn push_device_filters<'a>(
                 FROM device_tags filtered_device_tag
                 JOIN tags filtered_tag ON filtered_tag.id = filtered_device_tag.tag_id
                 WHERE filtered_device_tag.device_row_id = d.id
-                  AND filtered_tag.name = ",
+                  AND lower(filtered_tag.name) = lower(",
         );
         query.push_bind(tag);
-        query.push(" COLLATE NOCASE)");
+        query.push("))");
     }
     if let Some(search) = filter.query.as_deref() {
         let pattern = format!("%{}%", escape_like_literal(search));
-        query.push(" AND (d.device_id LIKE ");
+        query.push(" AND (lower(d.device_id) LIKE lower(");
         query.push_bind(pattern.clone());
-        query.push(" ESCAPE '\\' COLLATE NOCASE OR d.alias LIKE ");
+        query.push(") ESCAPE '\\' OR lower(COALESCE(d.alias, '')) LIKE lower(");
         query.push_bind(pattern.clone());
-        query.push(" ESCAPE '\\' COLLATE NOCASE OR d.device_name LIKE ");
+        query.push(") ESCAPE '\\' OR lower(COALESCE(d.device_name, '')) LIKE lower(");
         query.push_bind(pattern);
-        query.push(" ESCAPE '\\' COLLATE NOCASE)");
+        query.push(") ESCAPE '\\')");
     }
 }
 
-fn push_device_order(
-    query: &mut QueryBuilder<'_, Sqlite>,
-    sort_by: DeviceSortBy,
-    sort_dir: SortDirection,
-) {
+fn push_device_order(query: &mut PortableQuery, sort_by: DeviceSortBy, sort_dir: SortDirection) {
     query.push(" ORDER BY ");
     query.push(match sort_by {
-        DeviceSortBy::DeviceId => "d.device_id COLLATE NOCASE",
-        DeviceSortBy::Alias => "COALESCE(d.alias, '') COLLATE NOCASE",
-        DeviceSortBy::Hostname => "COALESCE(d.device_name, '') COLLATE NOCASE",
-        DeviceSortBy::Os => "COALESCE(d.os, '') COLLATE NOCASE",
-        DeviceSortBy::Status => "d.status COLLATE NOCASE",
+        DeviceSortBy::DeviceId => "lower(d.device_id)",
+        DeviceSortBy::Alias => "lower(COALESCE(d.alias, ''))",
+        DeviceSortBy::Hostname => "lower(COALESCE(d.device_name, ''))",
+        DeviceSortBy::Os => "lower(COALESCE(d.os, ''))",
+        DeviceSortBy::Status => "lower(d.status)",
         DeviceSortBy::LastSeen => "d.last_seen",
         DeviceSortBy::CreatedAt => "d.created_at",
         DeviceSortBy::UpdatedAt => "d.updated_at",
@@ -885,17 +865,16 @@ fn push_device_order(
 }
 
 async fn fetch_device_row_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     scope: OwnerScope,
     device_id: &str,
 ) -> InventoryResult<Option<ManagedDeviceRow>> {
-    let mut query = QueryBuilder::<Sqlite>::new(format!(
+    let mut query = PortableQuery::new(format!(
         "SELECT {MANAGED_DEVICE_COLUMNS} FROM devices d WHERE d.device_id = "
     ));
     query.push_bind(device_id);
     push_device_scope(&mut query, scope);
     query
-        .build()
         .fetch_optional(&mut *tx)
         .await?
         .map(|row| ManagedDeviceRow::from_row(&row).map_err(InventoryError::from))
@@ -903,27 +882,22 @@ async fn fetch_device_row_in_tx(
 }
 
 async fn fetch_tags_for_device_rows(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     device_row_ids: &[i64],
 ) -> InventoryResult<BTreeMap<i64, Vec<String>>> {
     let mut tags = BTreeMap::<i64, Vec<String>>::new();
     if device_row_ids.is_empty() {
         return Ok(tags);
     }
-    let mut query = QueryBuilder::<Sqlite>::new(
+    let mut query = PortableQuery::new(
         "SELECT relation.device_row_id, tag.name
          FROM device_tags relation
          JOIN tags tag ON tag.id = relation.tag_id
          WHERE relation.device_row_id IN (",
     );
-    {
-        let mut separated = query.separated(", ");
-        for row_id in device_row_ids {
-            separated.push_bind(row_id);
-        }
-    }
-    query.push(") ORDER BY relation.device_row_id, tag.name COLLATE NOCASE, tag.id");
-    for row in query.build().fetch_all(&mut *tx).await? {
+    query.push_bind_list(device_row_ids.iter().copied());
+    query.push(") ORDER BY relation.device_row_id, lower(tag.name), tag.id");
+    for row in query.fetch_all(&mut *tx).await? {
         tags.entry(row.try_get::<i64, _>("device_row_id")?)
             .or_default()
             .push(row.try_get::<String, _>("name")?);
@@ -932,7 +906,7 @@ async fn fetch_tags_for_device_rows(
 }
 
 async fn fetch_managed_device_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     scope: OwnerScope,
     device_id: &str,
 ) -> InventoryResult<Option<ManagedDevice>> {
@@ -947,15 +921,27 @@ async fn fetch_managed_device_in_tx(
 }
 
 async fn upsert_tag_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     owner_user_id: i64,
     name: &str,
 ) -> InventoryResult<TagRecord> {
-    Ok(sqlx::query_as::<_, TagRecord>(
+    let inserted = sqlx::query_as::<_, TagRecord>(
         "INSERT INTO tags(owner_user_id, name)
-         VALUES(?, ?)
-         ON CONFLICT(owner_user_id, name) DO UPDATE
+         VALUES($1, $2)
+         ON CONFLICT DO NOTHING
+         RETURNING id, owner_user_id, name, created_at, updated_at",
+    )
+    .bind(owner_user_id)
+    .bind(name)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(inserted) = inserted {
+        return Ok(inserted);
+    }
+    Ok(sqlx::query_as::<_, TagRecord>(
+        "UPDATE tags
          SET updated_at = current_timestamp
+         WHERE owner_user_id = $1 AND lower(name) = lower($2)
          RETURNING id, owner_user_id, name, created_at, updated_at",
     )
     .bind(owner_user_id)
@@ -995,15 +981,14 @@ impl Database {
         let mut tx = connection.begin().await?;
 
         let mut count_query =
-            QueryBuilder::<Sqlite>::new("SELECT COUNT(*) AS count FROM devices d WHERE 1 = 1");
+            PortableQuery::new("SELECT COUNT(*) AS count FROM devices d WHERE 1 = 1");
         push_device_filters(&mut count_query, scope, filter);
         let total = count_query
-            .build()
-            .fetch_one(&mut tx)
+            .fetch_one(&mut *tx)
             .await?
             .try_get::<i64, _>("count")?;
 
-        let mut items_query = QueryBuilder::<Sqlite>::new(format!(
+        let mut items_query = PortableQuery::new(format!(
             "SELECT {MANAGED_DEVICE_COLUMNS} FROM devices d WHERE 1 = 1"
         ));
         push_device_filters(&mut items_query, scope, filter);
@@ -1013,8 +998,7 @@ impl Database {
         items_query.push(" OFFSET ");
         items_query.push_bind(offset);
         let rows = items_query
-            .build()
-            .fetch_all(&mut tx)
+            .fetch_all(&mut *tx)
             .await?
             .iter()
             .map(ManagedDeviceRow::from_row)
@@ -1053,7 +1037,7 @@ impl Database {
         if owner_changed {
             if let Some(owner_user_id) = final_owner {
                 let active = sqlx::query_scalar::<_, i64>(
-                    "SELECT 1 FROM users WHERE id = ? AND is_active = 1",
+                    "SELECT CAST(1 AS BIGINT) FROM users WHERE id = $1 AND is_active = TRUE",
                 )
                 .bind(owner_user_id)
                 .fetch_optional(&mut tx)
@@ -1066,7 +1050,7 @@ impl Database {
             delete_device_memberships_in_tx(&mut tx, current.row_id)
                 .await
                 .map_err(address_book_error)?;
-            sqlx::query("DELETE FROM device_tags WHERE device_row_id = ?")
+            sqlx::query("DELETE FROM device_tags WHERE device_row_id = $1")
                 .bind(current.row_id)
                 .execute(&mut tx)
                 .await?;
@@ -1113,9 +1097,9 @@ impl Database {
 
         sqlx::query(
             "UPDATE devices
-             SET owner_user_id = ?, group_id = ?, alias = ?, note = ?,
+             SET owner_user_id = $1, group_id = $2, alias = $3, note = $4,
                  updated_at = current_timestamp
-             WHERE id = ?",
+             WHERE id = $5",
         )
         .bind(final_owner)
         .bind(final_group)
@@ -1148,7 +1132,7 @@ impl Database {
                 sqlx::query_as::<_, TagRecord>(
                     "SELECT id, owner_user_id, name, created_at, updated_at
                      FROM tags
-                     ORDER BY owner_user_id, name COLLATE NOCASE, id",
+                     ORDER BY owner_user_id, lower(name), id",
                 )
                 .fetch_all(connection.deref_mut())
                 .await?
@@ -1157,8 +1141,8 @@ impl Database {
                 sqlx::query_as::<_, TagRecord>(
                     "SELECT id, owner_user_id, name, created_at, updated_at
                      FROM tags
-                     WHERE owner_user_id = ?
-                     ORDER BY name COLLATE NOCASE, id",
+                     WHERE owner_user_id = $1
+                     ORDER BY lower(name), id",
                 )
                 .bind(owner_user_id)
                 .fetch_all(connection.deref_mut())
@@ -1210,21 +1194,16 @@ impl Database {
         let mut tx = connection.begin().await?;
         lock_inventory(&mut tx).await?;
 
-        let mut device_query = QueryBuilder::<Sqlite>::new(
+        let mut device_query = PortableQuery::new(
             "SELECT id, device_id, owner_user_id FROM devices WHERE device_id IN (",
         );
-        {
-            let mut separated = device_query.separated(", ");
-            for device_id in &unique_device_ids {
-                separated.push_bind(device_id);
-            }
-        }
+        device_query.push_bind_list(&unique_device_ids);
         device_query.push(")");
         if let OwnerScope::Owner(owner_user_id) = scope {
             device_query.push(" AND owner_user_id = ");
             device_query.push_bind(owner_user_id);
         }
-        let device_rows = device_query.build().fetch_all(&mut tx).await?;
+        let device_rows = device_query.fetch_all(&mut *tx).await?;
         if device_rows.len() != unique_device_ids.len() {
             return Err(InventoryError::NotFound);
         }
@@ -1261,22 +1240,12 @@ impl Database {
         let mut removed = 0;
         if !remove_by_key.is_empty() {
             let mut delete_query =
-                QueryBuilder::<Sqlite>::new("DELETE FROM device_tags WHERE device_row_id IN (");
-            {
-                let mut separated = delete_query.separated(", ");
-                for row_id in &device_row_ids {
-                    separated.push_bind(row_id);
-                }
-            }
+                PortableQuery::new("DELETE FROM device_tags WHERE device_row_id IN (");
+            delete_query.push_bind_list(device_row_ids.iter().copied());
             delete_query.push(") AND tag_id IN (SELECT id FROM tags WHERE name IN (");
-            {
-                let mut separated = delete_query.separated(", ");
-                for name in remove_by_key.values() {
-                    separated.push_bind(name);
-                }
-            }
+            delete_query.push_bind_list(remove_by_key.values());
             delete_query.push("))");
-            removed = delete_query.build().execute(&mut tx).await?.rows_affected();
+            removed = delete_query.execute(&mut *tx).await?.rows_affected();
         }
 
         let mut tag_ids = HashMap::<(i64, String), i64>::new();
@@ -1300,7 +1269,8 @@ impl Database {
                         InventoryError::Internal("upserted tag disappeared".to_owned())
                     })?;
                 added += sqlx::query(
-                    "INSERT OR IGNORE INTO device_tags(device_row_id, tag_id) VALUES(?, ?)",
+                    "INSERT INTO device_tags(device_row_id, tag_id) VALUES($1, $2)
+                     ON CONFLICT(device_row_id, tag_id) DO NOTHING",
                 )
                 .bind(row_id)
                 .bind(tag_id)
@@ -1319,7 +1289,7 @@ impl Database {
     }
 }
 
-async fn delete_orphan_tags_in_tx(tx: &mut Transaction<'_, Sqlite>) -> InventoryResult<()> {
+async fn delete_orphan_tags_in_tx(tx: &mut Transaction<'_, Any>) -> InventoryResult<()> {
     sqlx::query(
         "DELETE FROM tags
          WHERE NOT EXISTS (
@@ -1347,7 +1317,7 @@ const DELETION_RECEIPT_COLUMNS: &str = "
 ";
 
 async fn fetch_deletion_receipt_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut Transaction<'_, Any>,
     actor_user_id: i64,
     device_id: &str,
     management_generation: &str,
@@ -1355,9 +1325,9 @@ async fn fetch_deletion_receipt_in_tx(
     let row = sqlx::query_as::<_, DeletionReceiptRow>(&format!(
         "SELECT {DELETION_RECEIPT_COLUMNS}
          FROM device_deletion_outbox
-         WHERE actor_user_id = ?
-           AND device_id = ?
-           AND management_generation = ?
+         WHERE actor_user_id = $1
+           AND device_id = $2
+           AND management_generation = $3
            AND (state = 'pending' OR expires_at > current_timestamp)"
     ))
     .bind(actor_user_id)
@@ -1386,9 +1356,9 @@ impl Database {
         let row = sqlx::query_as::<_, DeletionReceiptRow>(&format!(
             "SELECT {DELETION_RECEIPT_COLUMNS}
              FROM device_deletion_outbox
-             WHERE actor_user_id = ?
-               AND device_id = ?
-               AND management_generation = ?
+             WHERE actor_user_id = $1
+               AND device_id = $2
+               AND management_generation = $3
                AND (state = 'pending' OR expires_at > current_timestamp)"
         ))
         .bind(actor_user_id)
@@ -1458,12 +1428,12 @@ impl Database {
             return Ok(receipt_outcome(receipt));
         }
 
-        let mut candidate_query = QueryBuilder::<Sqlite>::new(
+        let mut candidate_query = PortableQuery::new(
             "SELECT id, management_generation FROM devices d WHERE d.device_id = ",
         );
         candidate_query.push_bind(device_id);
         push_device_scope(&mut candidate_query, scope);
-        let Some(candidate) = candidate_query.build().fetch_optional(&mut tx).await? else {
+        let Some(candidate) = candidate_query.fetch_optional(&mut *tx).await? else {
             return Ok(DeviceDeleteOutcome::ScopedMiss);
         };
         let row_id = candidate.try_get::<i64, _>("id")?;
@@ -1483,7 +1453,7 @@ impl Database {
             .await
             .map_err(address_book_error)?;
 
-        let mut delete_query = QueryBuilder::<Sqlite>::new("DELETE FROM devices WHERE id = ");
+        let mut delete_query = PortableQuery::new("DELETE FROM devices WHERE id = ");
         delete_query.push_bind(row_id);
         delete_query.push(" AND device_id = ");
         delete_query.push_bind(device_id);
@@ -1497,7 +1467,7 @@ impl Database {
             }
         }
         delete_query.push(" RETURNING guid, device_id, management_generation, owner_user_id");
-        let Some(deleted) = delete_query.build().fetch_optional(&mut tx).await? else {
+        let Some(deleted) = delete_query.fetch_optional(&mut *tx).await? else {
             return Ok(DeviceDeleteOutcome::ScopedMiss);
         };
         let deleted_guid = deleted.try_get::<Vec<u8>, _>("guid")?;
@@ -1506,7 +1476,7 @@ impl Database {
             "INSERT INTO device_deletion_outbox(
                  actor_user_id, device_id, management_generation, deleted_guid
              )
-             VALUES(?, ?, ?, ?)
+             VALUES($1, $2, $3, $4)
              RETURNING {DELETION_RECEIPT_COLUMNS}"
         ))
         .bind(actor_user_id)
@@ -1530,24 +1500,25 @@ impl Database {
         lease_seconds: i64,
     ) -> InventoryResult<Option<DeletionReceipt>> {
         let lease_seconds = lease_seconds.max(1);
+        let lease_until = Utc::now().naive_utc() + ChronoDuration::seconds(lease_seconds);
         let lease_token = uuid::Uuid::new_v4().simple().to_string();
         let mut connection = self.pool.get().await.map_err(pool_error)?;
         let row = sqlx::query_as::<_, DeletionReceiptRow>(&format!(
             "UPDATE device_deletion_outbox
-             SET lease_token = ?,
-                 lease_until = datetime(current_timestamp, printf('+%d seconds', ?)),
+             SET lease_token = $1,
+                 lease_until = $2,
                  attempt_count = attempt_count + 1,
                  updated_at = current_timestamp
-             WHERE actor_user_id = ?
-               AND device_id = ?
-               AND management_generation = ?
+             WHERE actor_user_id = $3
+               AND device_id = $4
+               AND management_generation = $5
                AND state = 'pending'
                AND next_attempt_at <= current_timestamp
                AND (lease_until IS NULL OR lease_until <= current_timestamp)
              RETURNING {DELETION_RECEIPT_COLUMNS}"
         ))
         .bind(lease_token)
-        .bind(lease_seconds)
+        .bind(lease_until)
         .bind(actor_user_id)
         .bind(device_id)
         .bind(management_generation)
@@ -1567,10 +1538,11 @@ impl Database {
         let mut receipts = Vec::with_capacity(limit as usize);
         for _ in 0..limit {
             let lease_token = uuid::Uuid::new_v4().simple().to_string();
+            let lease_until = Utc::now().naive_utc() + ChronoDuration::seconds(lease_seconds);
             let row = sqlx::query_as::<_, DeletionReceiptRow>(&format!(
                 "UPDATE device_deletion_outbox
-                 SET lease_token = ?,
-                     lease_until = datetime(current_timestamp, printf('+%d seconds', ?)),
+                 SET lease_token = $1,
+                     lease_until = $2,
                      attempt_count = attempt_count + 1,
                      updated_at = current_timestamp
                  WHERE id = (
@@ -1588,7 +1560,7 @@ impl Database {
                  RETURNING {DELETION_RECEIPT_COLUMNS}"
             ))
             .bind(lease_token)
-            .bind(lease_seconds)
+            .bind(lease_until)
             .fetch_optional(connection.deref_mut())
             .await?;
             let Some(row) = row else {
@@ -1606,20 +1578,21 @@ impl Database {
         completed_ttl_seconds: i64,
     ) -> InventoryResult<bool> {
         let completed_ttl_seconds = completed_ttl_seconds.max(1);
+        let expires_at = Utc::now().naive_utc() + ChronoDuration::seconds(completed_ttl_seconds);
         let mut connection = self.pool.get().await.map_err(pool_error)?;
         let affected = sqlx::query(
             "UPDATE device_deletion_outbox
              SET state = 'completed',
                  completed_at = current_timestamp,
-                 expires_at = datetime(current_timestamp, printf('+%d seconds', ?)),
+                 expires_at = $1,
                  lease_token = NULL,
                  lease_until = NULL,
                  updated_at = current_timestamp
-             WHERE id = ?
+             WHERE id = $2
                AND state = 'pending'
-               AND lease_token = ?",
+               AND lease_token = $3",
         )
-        .bind(completed_ttl_seconds)
+        .bind(expires_at)
         .bind(receipt_id)
         .bind(lease_token)
         .execute(connection.deref_mut())
@@ -1634,19 +1607,19 @@ impl Database {
         retry_after_seconds: i64,
     ) -> InventoryResult<bool> {
         let retry_after_seconds = retry_after_seconds.max(1);
+        let next_attempt_at = Utc::now().naive_utc() + ChronoDuration::seconds(retry_after_seconds);
         let mut connection = self.pool.get().await.map_err(pool_error)?;
         let affected = sqlx::query(
             "UPDATE device_deletion_outbox
-             SET next_attempt_at =
-                     datetime(current_timestamp, printf('+%d seconds', ?)),
+             SET next_attempt_at = $1,
                  lease_token = NULL,
                  lease_until = NULL,
                  updated_at = current_timestamp
-             WHERE id = ?
+             WHERE id = $2
                AND state = 'pending'
-               AND lease_token = ?",
+               AND lease_token = $3",
         )
-        .bind(retry_after_seconds)
+        .bind(next_attempt_at)
         .bind(receipt_id)
         .bind(lease_token)
         .execute(connection.deref_mut())
@@ -1655,7 +1628,7 @@ impl Database {
     }
 }
 
-pub(super) async fn verify_inventory_integrity(tx: &mut Transaction<'_, Sqlite>) -> ResultType<()> {
+pub(super) async fn verify_inventory_integrity(tx: &mut Transaction<'_, Any>) -> ResultType<()> {
     if let Some(row) = sqlx::query(
         "SELECT child.id
          FROM groups child
@@ -1876,7 +1849,7 @@ mod tests {
             "INSERT INTO devices(
                  guid, uuid, pk, device_id, info, status, last_seen
              )
-             VALUES(?, ?, ?, ?, '{}', 'offline', current_timestamp)",
+             VALUES($1, $2, $3, $4, '{}', 'offline', current_timestamp)",
         )
         .bind(&guid)
         .bind(b"test-uuid".as_slice())
@@ -1886,7 +1859,7 @@ mod tests {
         .await
         .unwrap();
         let generation = sqlx::query_scalar::<_, String>(
-            "SELECT management_generation FROM devices WHERE device_id = ?",
+            "SELECT management_generation FROM devices WHERE device_id = $1",
         )
         .bind(device_id)
         .fetch_one(connection.deref_mut())
@@ -1928,7 +1901,7 @@ mod tests {
             assert_eq!(foreign_keys, 1);
             let replacement = "0123456789abcdef0123456789abcdef";
             let error =
-                sqlx::query("UPDATE devices SET management_generation = ? WHERE device_id = ?")
+                sqlx::query("UPDATE devices SET management_generation = $1 WHERE device_id = $2")
                     .bind(replacement)
                     .bind("migration-device")
                     .execute(connection.deref_mut())
@@ -1939,21 +1912,22 @@ mod tests {
                 .contains("device_management_generation_immutable"));
             let mut parent_group_id = None;
             for depth in 1..=256 {
-                let inserted = sqlx::query(
+                let inserted = sqlx::query_scalar::<_, i64>(
                     "INSERT INTO groups(name, owner_user_id, parent_group_id)
-                     VALUES(?, ?, ?)",
+                     VALUES($1, $2, $3)
+                     RETURNING id",
                 )
                 .bind(format!("depth-{depth}"))
                 .bind(owner)
                 .bind(parent_group_id)
-                .execute(connection.deref_mut())
+                .fetch_one(connection.deref_mut())
                 .await
                 .unwrap();
-                parent_group_id = Some(inserted.last_insert_rowid());
+                parent_group_id = Some(inserted);
             }
             let depth_error = sqlx::query(
                 "INSERT INTO groups(name, owner_user_id, parent_group_id)
-                 VALUES('depth-257', ?, ?)",
+                 VALUES('depth-257', $1, $2)",
             )
             .bind(owner)
             .bind(parent_group_id)
@@ -2024,12 +1998,13 @@ mod tests {
             insert_device(&db, "group-device", Some(owner)).await;
             {
                 let mut connection = db.pool.get().await.unwrap();
-                let error =
-                    sqlx::query("UPDATE devices SET group_id = ? WHERE device_id = 'group-device'")
-                        .bind(other_group.id)
-                        .execute(connection.deref_mut())
-                        .await
-                        .unwrap_err();
+                let error = sqlx::query(
+                    "UPDATE devices SET group_id = $1 WHERE device_id = 'group-device'",
+                )
+                .bind(other_group.id)
+                .execute(connection.deref_mut())
+                .await
+                .unwrap_err();
                 assert!(error.to_string().contains("device_group_owner_mismatch"));
             }
             let batch = db
@@ -2091,7 +2066,7 @@ mod tests {
                                   + tens.value * 10
                                   + ones.value
                             ),
-                            ?, ?
+                            $1, $2
                      FROM digits thousands
                      CROSS JOIN digits hundreds
                      CROSS JOIN digits tens
@@ -2390,7 +2365,7 @@ mod tests {
                      INSERT INTO device_deletion_outbox(
                          actor_user_id, device_id, management_generation, deleted_guid
                      )
-                     SELECT ?, 'capacity-' || value, printf('%032x', value), randomblob(16)
+                     SELECT $1, 'capacity-' || value, printf('%032x', value), randomblob(16)
                      FROM sequence",
                 )
                 .bind(owner)
@@ -2477,9 +2452,9 @@ mod tests {
             let mut connection = db.pool.get().await.unwrap();
             let receipt_count = sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM device_deletion_outbox
-                 WHERE actor_user_id = ?
-                   AND device_id = ?
-                   AND management_generation = ?",
+                 WHERE actor_user_id = $1
+                   AND device_id = $2
+                   AND management_generation = $3",
             )
             .bind(owner)
             .bind("concurrent-delete-device")
@@ -2592,7 +2567,7 @@ mod tests {
             entered_receiver.await.unwrap();
             sqlx::query(
                 "UPDATE devices
-                 SET owner_user_id = ?, updated_at = current_timestamp
+                 SET owner_user_id = $1, updated_at = current_timestamp
                  WHERE device_id = 'transfer-device'",
             )
             .bind(new_owner)
