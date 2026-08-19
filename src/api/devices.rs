@@ -39,6 +39,8 @@ pub async fn handle_list_devices(
                 query: query.q,
                 page: query.page,
                 page_size: query.page_size,
+                sort_by: query.sort_by,
+                sort_dir: query.sort_dir,
             },
         )
         .await
@@ -401,6 +403,18 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|item| item["device_id"] != "device-b1"));
+
+            let sorted = get(
+                &app,
+                "/api/devices?sort_by=device_id&sort_dir=desc&page_size=2",
+                &user_a_token,
+            )
+            .await;
+            assert_eq!(sorted.status(), StatusCode::OK);
+            let sorted = response_json(sorted).await;
+            assert_eq!(sorted["total"], 3);
+            assert_eq!(sorted["items"][0]["device_id"], "device-a3");
+            assert_eq!(sorted["items"][1]["device_id"], "device-a2");
 
             let hidden_device = get(&app, "/api/devices/device-b1", &user_a_token).await;
             assert_eq!(hidden_device.status(), StatusCode::NOT_FOUND);

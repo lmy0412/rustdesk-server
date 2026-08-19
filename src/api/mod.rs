@@ -32,12 +32,16 @@ use crate::{
 };
 #[cfg(test)]
 use axum::extract::connect_info::ConnectInfo;
+#[cfg(any(test, not(feature = "pro")))]
+use axum::http::StatusCode;
+#[cfg(not(feature = "pro"))]
+use axum::Json;
 use axum::{
-    http::StatusCode,
     routing::{any, get, post},
-    Extension, Json, Router,
+    Extension, Router,
 };
 use hbb_common::log;
+#[cfg(any(test, not(feature = "pro")))]
 use serde_json::{json, Value};
 use std::{net::SocketAddr, sync::mpsc::Sender};
 use tower::ServiceBuilder;
@@ -289,8 +293,14 @@ fn build_router_with_states(
                 .layer(Extension(protection))
                 .layer(Extension(security))
                 .layer(Extension(audit)),
-        )
-        .fallback(any(handle_404))
+        );
+
+    #[cfg(feature = "pro")]
+    let app = app.fallback(any(crate::web::handle_web_request));
+    #[cfg(not(feature = "pro"))]
+    let app = app.fallback(any(handle_404));
+
+    let app = app
         .layer(middleware::rate_limit_layer())
         .layer(axum::middleware::from_fn(middleware::request_logger))
         .layer(middleware::cors_middleware(&oidc_config));
@@ -387,6 +397,7 @@ pub fn api_server_forever(
     });
 }
 
+#[cfg(not(feature = "pro"))]
 async fn handle_404() -> (StatusCode, Json<Value>) {
     (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" })))
 }

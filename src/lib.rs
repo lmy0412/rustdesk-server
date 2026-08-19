@@ -17,3 +17,5 @@ pub use peer::{
 pub mod pubkey;
 pub mod security;
 mod version;
+#[cfg(feature = "pro")]
+pub mod web;

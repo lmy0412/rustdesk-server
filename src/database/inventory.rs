@@ -4,6 +4,7 @@ use super::{
     },
     Database,
 };
+use crate::models::device::{DeviceSortBy, SortDirection};
 use chrono::NaiveDateTime;
 use hbb_common::{bail, ResultType};
 use sqlx::{Connection, FromRow, QueryBuilder, Row, Sqlite, Transaction};
@@ -157,6 +158,8 @@ pub struct DeviceListFilter {
     pub query: Option<String>,
     pub page: i64,
     pub page_size: i64,
+    pub sort_by: DeviceSortBy,
+    pub sort_dir: SortDirection,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -858,6 +861,29 @@ fn push_device_filters<'a>(
     }
 }
 
+fn push_device_order(
+    query: &mut QueryBuilder<'_, Sqlite>,
+    sort_by: DeviceSortBy,
+    sort_dir: SortDirection,
+) {
+    query.push(" ORDER BY ");
+    query.push(match sort_by {
+        DeviceSortBy::DeviceId => "d.device_id COLLATE NOCASE",
+        DeviceSortBy::Alias => "COALESCE(d.alias, '') COLLATE NOCASE",
+        DeviceSortBy::Hostname => "COALESCE(d.device_name, '') COLLATE NOCASE",
+        DeviceSortBy::Os => "COALESCE(d.os, '') COLLATE NOCASE",
+        DeviceSortBy::Status => "d.status COLLATE NOCASE",
+        DeviceSortBy::LastSeen => "d.last_seen",
+        DeviceSortBy::CreatedAt => "d.created_at",
+        DeviceSortBy::UpdatedAt => "d.updated_at",
+    });
+    query.push(match sort_dir {
+        SortDirection::Asc => " ASC",
+        SortDirection::Desc => " DESC",
+    });
+    query.push(", d.id ASC");
+}
+
 async fn fetch_device_row_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     scope: OwnerScope,
@@ -981,7 +1007,8 @@ impl Database {
             "SELECT {MANAGED_DEVICE_COLUMNS} FROM devices d WHERE 1 = 1"
         ));
         push_device_filters(&mut items_query, scope, filter);
-        items_query.push(" ORDER BY d.id LIMIT ");
+        push_device_order(&mut items_query, filter.sort_by, filter.sort_dir);
+        items_query.push(" LIMIT ");
         items_query.push_bind(page_size);
         items_query.push(" OFFSET ");
         items_query.push_bind(offset);
