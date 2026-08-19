@@ -1,0 +1,88 @@
+name: rustdesk-pro
+
+x-rustdesk-common: &rustdesk-common
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.pro
+  image: ${RUSTDESK_PRO_IMAGE:-rustdesk-server-pro:local}
+  restart: unless-stopped
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  volumes:
+    - rustdesk-data:/var/lib/rustdesk
+    - ./config.pro.toml:/etc/rustdesk-server/config.toml:ro
+  networks:
+    - rustdesk
+
+services:
+  hbbs:
+    <<: *rustdesk-common
+    entrypoint: ["/usr/local/bin/hbbs"]
+    command: ["--config", "/etc/rustdesk-server/config.toml"]
+    environment:
+      RUSTDESK_SERVER__DATABASE_URL: ${RUSTDESK_DATABASE_URL:-}
+      RUSTDESK_PRO__JWT_SECRET: ${RUSTDESK_JWT_SECRET:?请在 .env 中设置 RUSTDESK_JWT_SECRET}
+      RUSTDESK_INITIAL_ADMIN_PASSWORD: ${RUSTDESK_INITIAL_ADMIN_PASSWORD:-}
+      MAX_DATABASE_CONNECTIONS: ${MAX_DATABASE_CONNECTIONS:-1}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "${RUSTDESK_API_BIND:-127.0.0.1}:21114:21114"
+      - "21115:21115"
+      - "21116:21116"
+      - "21116:21116/udp"
+      - "21118:21118"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:21114/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  hbbr:
+    <<: *rustdesk-common
+    entrypoint: ["/usr/local/bin/hbbr"]
+    command: ["--config", "/etc/rustdesk-server/config.toml"]
+    environment:
+      RUSTDESK_PRO__JWT_SECRET: ${RUSTDESK_JWT_SECRET:?请在 .env 中设置 RUSTDESK_JWT_SECRET}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "21117:21117"
+      - "21119:21119"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "21117"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  postgres:
+    # 与生产镜像内的 pg_dump/pg_restore 主版本保持一致。
+    image: postgres:15-alpine
+    profiles: ["postgres"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rustdesk}
+      POSTGRES_USER: ${POSTGRES_USER:-rustdesk}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - rustdesk
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  rustdesk:
+    driver: bridge
+
+volumes:
+  rustdesk-data:
+  postgres-data:

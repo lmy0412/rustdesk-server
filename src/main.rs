@@ -46,7 +46,7 @@ fn main() -> ResultType<()> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let (device_control_tx, device_control_rx) =
         hbb_common::tokio::sync::mpsc::channel(DEVICE_INVALIDATION_CHANNEL_CAPACITY);
-    let db_url = config.server.db_path.clone();
+    let db_url = config.database_url().to_string();
     let auth_state = AuthState::from_config(&config.pro);
     let oidc_config = config.pro.oidc.clone();
     let _api_thread = std::thread::spawn(move || {

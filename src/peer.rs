@@ -566,7 +566,7 @@ fn peer_from_database(row: database::Peer) -> LockPeer {
 fn configured_db_path() -> Option<String> {
     crate::config::global_config().and_then(|cfg_lock| {
         let cfg = cfg_lock.read().ok()?;
-        let path = cfg.server.db_path.clone();
+        let path = cfg.database_url().to_string();
         if path.is_empty() {
             None
         } else {
