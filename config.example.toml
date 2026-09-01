@@ -1,0 +1,55 @@
+[pro]
+enabled = false
+
+[pro.oidc]
+enabled = false
+issuer_url = ""
+client_id = ""
+client_secret = ""
+redirect_uri = ""
+post_login_url = ""
+allowed_origins = [
+    # "https://console.example.com",
+]
+
+# 首次启动时以这里的值创建数据库策略；之后 Web 控制台通过
+# /api/security/policies 更新的数据库值优先。
+[pro.security]
+password_min_length = 12
+password_require_number = true
+password_require_symbol = true
+login_max_failures = 5
+login_lock_minutes = 15
+session_timeout_minutes = 1440
+# 为空表示不限制管理员直连 IP；服务端不信任 X-Forwarded-For。
+allowed_admin_cidrs = []
+audit_retention_days = 180
+
+# 空数据库首次启动前，请通过进程管理器或 secret manager 注入
+# RUSTDESK_INITIAL_ADMIN_PASSWORD。首次管理员创建成功后立即移除该环境变量。
+#
+# 地址簿 schema 升级是停写升级：启动新版本前必须停止并排空所有旧版服务端
+# 写进程。不得让新旧二进制对同一 SQLite 数据库滚动混跑。
+# 详细步骤见 docs/address-book-migration.md。
+
+# 限流只使用服务端看到的直连 peer IP，不解析也不信任 X-Forwarded-For。
+# 若约 300 台以上设备共享同一 NAT/反向代理出口，请按单出口设备规模调高
+# telemetry_peer_capacity / telemetry_peer_refill_per_minute；认证配额也应按
+# 同一出口的并发用户规模评估，或在可信反向代理侧实施额外限流。
+[api_rate_limit]
+max_in_flight = 1024
+telemetry_max_in_flight = 768
+auth_max_in_flight = 64
+argon2_max_in_flight = 8
+request_timeout_ms = 10000
+telemetry_peer_capacity = 36000
+telemetry_peer_refill_per_minute = 18000
+auth_peer_capacity = 60
+auth_peer_refill_per_minute = 30
+device_capacity = 120
+device_refill_per_minute = 60
+address_book_actor_capacity = 30
+address_book_actor_refill_per_minute = 15
+peer_lru_capacity = 10000
+device_lru_capacity = 100000
+actor_lru_capacity = 100000

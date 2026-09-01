@@ -7,7 +7,7 @@ use once_cell::sync::OnceCell;
 use serde_derive::{Deserialize, Serialize};
 use std::{
     fmt,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
@@ -25,11 +25,50 @@ fn default_relay_server() -> String {
 fn default_api_server() -> String {
     "0.0.0.0:21114".to_string()
 }
+fn default_jwt_secret() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+fn default_jwt_expiry_hours() -> i64 {
+    24
+}
+fn default_refresh_expiry_days() -> i64 {
+    7
+}
+fn default_password_min_length() -> usize {
+    12
+}
+fn default_login_max_failures() -> u32 {
+    5
+}
+fn default_login_lock_minutes() -> u32 {
+    15
+}
+fn default_session_timeout_minutes() -> u32 {
+    1440
+}
+fn default_audit_retention_days() -> u32 {
+    180
+}
 fn default_key_file() -> String {
     "/var/lib/rustdesk/id_ed25519".to_string()
 }
 fn default_db_path() -> String {
-    "/var/lib/rustdesk/db.sqlite3".to_string()
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        let mut db = "db_v2.sqlite3".to_owned();
+        if let Some(path) = hbb_common::config::Config::icon_path().parent() {
+            db = format!("{}\\{}", path.to_str().unwrap_or("."), db);
+        }
+        db
+    }
+    #[cfg(all(windows, debug_assertions))]
+    {
+        "db_v2.sqlite3".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        "./db_v2.sqlite3".to_string()
+    }
 }
 fn default_rendezvous_servers() -> Vec<String> {
     Vec::new()
@@ -51,6 +90,54 @@ fn default_downgrade_threshold() -> f64 {
 }
 fn default_downgrade_start_check() -> u64 {
     1800
+}
+fn default_api_max_in_flight() -> usize {
+    1024
+}
+fn default_telemetry_max_in_flight() -> usize {
+    768
+}
+fn default_auth_max_in_flight() -> usize {
+    64
+}
+fn default_argon2_max_in_flight() -> usize {
+    8
+}
+fn default_api_request_timeout_ms() -> u64 {
+    10_000
+}
+fn default_telemetry_peer_capacity() -> u64 {
+    36_000
+}
+fn default_telemetry_peer_refill_per_minute() -> u64 {
+    18_000
+}
+fn default_auth_peer_capacity() -> u64 {
+    60
+}
+fn default_auth_peer_refill_per_minute() -> u64 {
+    30
+}
+fn default_device_capacity() -> u64 {
+    120
+}
+fn default_device_refill_per_minute() -> u64 {
+    60
+}
+fn default_address_book_actor_capacity() -> u64 {
+    30
+}
+fn default_address_book_actor_refill_per_minute() -> u64 {
+    15
+}
+fn default_peer_lru_capacity() -> usize {
+    10_000
+}
+fn default_device_lru_capacity() -> usize {
+    100_000
+}
+fn default_actor_lru_capacity() -> usize {
+    100_000
 }
 
 // ==========================
@@ -93,6 +180,8 @@ impl Default for SmtpConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OidcConfig {
     #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
     pub issuer_url: String,
     #[serde(default)]
     pub client_id: String,
@@ -101,15 +190,73 @@ pub struct OidcConfig {
     pub client_secret: String,
     #[serde(default)]
     pub redirect_uri: String,
+    #[serde(default)]
+    pub post_login_url: String,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 impl Default for OidcConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             issuer_url: String::new(),
             client_id: String::new(),
             client_secret: String::new(),
             redirect_uri: String::new(),
+            post_login_url: String::new(),
+            allowed_origins: Vec::new(),
+        }
+    }
+}
+
+impl OidcConfig {
+    pub fn is_configured(&self) -> bool {
+        self.enabled
+            && !self.issuer_url.trim().is_empty()
+            && !self.client_id.trim().is_empty()
+            && !self.client_secret.trim().is_empty()
+            && !self.redirect_uri.trim().is_empty()
+            && !self.post_login_url.trim().is_empty()
+    }
+}
+
+/// 企业安全策略。配置文件提供初始值，Web API 更新后由数据库值覆盖。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    #[serde(default = "default_password_min_length")]
+    pub password_min_length: usize,
+    #[serde(default = "default_true")]
+    pub password_require_number: bool,
+    #[serde(default = "default_true")]
+    pub password_require_symbol: bool,
+    #[serde(default = "default_login_max_failures")]
+    pub login_max_failures: u32,
+    #[serde(default = "default_login_lock_minutes")]
+    pub login_lock_minutes: u32,
+    #[serde(default = "default_session_timeout_minutes")]
+    pub session_timeout_minutes: u32,
+    #[serde(default)]
+    pub allowed_admin_cidrs: Vec<String>,
+    #[serde(default = "default_audit_retention_days")]
+    pub audit_retention_days: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            password_min_length: default_password_min_length(),
+            password_require_number: true,
+            password_require_symbol: true,
+            login_max_failures: default_login_max_failures(),
+            login_lock_minutes: default_login_lock_minutes(),
+            session_timeout_minutes: default_session_timeout_minutes(),
+            allowed_admin_cidrs: Vec::new(),
+            audit_retention_days: default_audit_retention_days(),
         }
     }
 }
@@ -125,10 +272,19 @@ pub struct ProConfig {
     pub tls_cert: String,
     #[serde(default = "default_tls_key")]
     pub tls_key: String,
+    /// 敏感字段：日志输出时必须脱敏。
+    #[serde(default = "default_jwt_secret")]
+    pub jwt_secret: String,
+    #[serde(default = "default_jwt_expiry_hours")]
+    pub jwt_expiry_hours: i64,
+    #[serde(default = "default_refresh_expiry_days")]
+    pub refresh_expiry_days: i64,
     #[serde(default)]
     pub oidc: OidcConfig,
     #[serde(default)]
     pub smtp: SmtpConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 fn default_web_port() -> u16 {
@@ -148,8 +304,12 @@ impl Default for ProConfig {
             web_port: default_web_port(),
             tls_cert: default_tls_cert(),
             tls_key: default_tls_key(),
+            jwt_secret: default_jwt_secret(),
+            jwt_expiry_hours: default_jwt_expiry_hours(),
+            refresh_expiry_days: default_refresh_expiry_days(),
             oidc: OidcConfig::default(),
             smtp: SmtpConfig::default(),
+            security: SecurityConfig::default(),
         }
     }
 }
@@ -227,6 +387,9 @@ pub struct ServerConfig {
     pub key_file: String,
     #[serde(default = "default_db_path")]
     pub db_path: String,
+    /// 可选数据库 URL。为空时继续使用 db_path，以保持 OSS/SQLite 配置兼容。
+    #[serde(default)]
+    pub database_url: String,
 }
 
 impl Default for ServerConfig {
@@ -238,6 +401,67 @@ impl Default for ServerConfig {
             key: default_key(),
             key_file: default_key_file(),
             db_path: default_db_path(),
+            database_url: String::new(),
+        }
+    }
+}
+
+/// API 入口的资源保护配置。全部字段为冷配置，修改后必须重启进程。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiRateLimitConfig {
+    #[serde(default = "default_api_max_in_flight")]
+    pub max_in_flight: usize,
+    #[serde(default = "default_telemetry_max_in_flight")]
+    pub telemetry_max_in_flight: usize,
+    #[serde(default = "default_auth_max_in_flight")]
+    pub auth_max_in_flight: usize,
+    #[serde(default = "default_argon2_max_in_flight")]
+    pub argon2_max_in_flight: usize,
+    #[serde(default = "default_api_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+    #[serde(default = "default_telemetry_peer_capacity")]
+    pub telemetry_peer_capacity: u64,
+    #[serde(default = "default_telemetry_peer_refill_per_minute")]
+    pub telemetry_peer_refill_per_minute: u64,
+    #[serde(default = "default_auth_peer_capacity")]
+    pub auth_peer_capacity: u64,
+    #[serde(default = "default_auth_peer_refill_per_minute")]
+    pub auth_peer_refill_per_minute: u64,
+    #[serde(default = "default_device_capacity")]
+    pub device_capacity: u64,
+    #[serde(default = "default_device_refill_per_minute")]
+    pub device_refill_per_minute: u64,
+    #[serde(default = "default_address_book_actor_capacity")]
+    pub address_book_actor_capacity: u64,
+    #[serde(default = "default_address_book_actor_refill_per_minute")]
+    pub address_book_actor_refill_per_minute: u64,
+    #[serde(default = "default_peer_lru_capacity")]
+    pub peer_lru_capacity: usize,
+    #[serde(default = "default_device_lru_capacity")]
+    pub device_lru_capacity: usize,
+    #[serde(default = "default_actor_lru_capacity")]
+    pub actor_lru_capacity: usize,
+}
+
+impl Default for ApiRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_in_flight: default_api_max_in_flight(),
+            telemetry_max_in_flight: default_telemetry_max_in_flight(),
+            auth_max_in_flight: default_auth_max_in_flight(),
+            argon2_max_in_flight: default_argon2_max_in_flight(),
+            request_timeout_ms: default_api_request_timeout_ms(),
+            telemetry_peer_capacity: default_telemetry_peer_capacity(),
+            telemetry_peer_refill_per_minute: default_telemetry_peer_refill_per_minute(),
+            auth_peer_capacity: default_auth_peer_capacity(),
+            auth_peer_refill_per_minute: default_auth_peer_refill_per_minute(),
+            device_capacity: default_device_capacity(),
+            device_refill_per_minute: default_device_refill_per_minute(),
+            address_book_actor_capacity: default_address_book_actor_capacity(),
+            address_book_actor_refill_per_minute: default_address_book_actor_refill_per_minute(),
+            peer_lru_capacity: default_peer_lru_capacity(),
+            device_lru_capacity: default_device_lru_capacity(),
+            actor_lru_capacity: default_actor_lru_capacity(),
         }
     }
 }
@@ -253,6 +477,8 @@ pub struct AppConfig {
     pub relay: RelayConfig,
     #[serde(default)]
     pub pro: ProConfig,
+    #[serde(default)]
+    pub api_rate_limit: ApiRateLimitConfig,
 }
 
 impl Default for AppConfig {
@@ -262,6 +488,7 @@ impl Default for AppConfig {
             rendezvous: RendezvousConfig::default(),
             relay: RelayConfig::default(),
             pro: ProConfig::default(),
+            api_rate_limit: ApiRateLimitConfig::default(),
         }
     }
 }
@@ -382,11 +609,14 @@ impl fmt::Display for OidcConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "OidcConfig {{ issuer_url: {}, client_id: {}, client_secret: {}, redirect_uri: {} }}",
+            "OidcConfig {{ enabled: {}, issuer_url: {}, client_id: {}, client_secret: {}, redirect_uri: {}, post_login_url: {}, allowed_origins: {:?} }}",
+            self.enabled,
             self.issuer_url,
             self.client_id,
             mask_sensitive(&self.client_secret),
-            self.redirect_uri
+            self.redirect_uri,
+            self.post_login_url,
+            self.allowed_origins
         )
     }
 }
@@ -395,8 +625,34 @@ impl fmt::Display for ProConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ProConfig {{ enabled: {}, web_port: {}, tls_cert: {}, tls_key: {}, oidc: {}, smtp: {} }}",
-            self.enabled, self.web_port, self.tls_cert, self.tls_key, self.oidc, self.smtp
+            "ProConfig {{ enabled: {}, web_port: {}, tls_cert: {}, tls_key: {}, jwt_secret: {}, jwt_expiry_hours: {}, refresh_expiry_days: {}, oidc: {}, smtp: {}, security: {} }}",
+            self.enabled,
+            self.web_port,
+            self.tls_cert,
+            self.tls_key,
+            mask_sensitive(&self.jwt_secret),
+            self.jwt_expiry_hours,
+            self.refresh_expiry_days,
+            self.oidc,
+            self.smtp,
+            self.security
+        )
+    }
+}
+
+impl fmt::Display for SecurityConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SecurityConfig {{ password_min_length: {}, password_require_number: {}, password_require_symbol: {}, login_max_failures: {}, login_lock_minutes: {}, session_timeout_minutes: {}, allowed_admin_cidrs: {:?}, audit_retention_days: {} }}",
+            self.password_min_length,
+            self.password_require_number,
+            self.password_require_symbol,
+            self.login_max_failures,
+            self.login_lock_minutes,
+            self.session_timeout_minutes,
+            self.allowed_admin_cidrs,
+            self.audit_retention_days,
         )
     }
 }
@@ -431,13 +687,66 @@ impl fmt::Display for ServerConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ServerConfig {{ id_server: {}, relay_server: {}, api_server: {}, key: {}, key_file: {}, db_path: {} }}",
+            "ServerConfig {{ id_server: {}, relay_server: {}, api_server: {}, key: {}, key_file: {}, db_path: {}, database_url: {} }}",
             self.id_server,
             self.relay_server,
             self.api_server,
             mask_sensitive(&self.key),
             self.key_file,
-            self.db_path
+            self.db_path,
+            mask_database_url(&self.database_url)
+        )
+    }
+}
+
+fn mask_database_url(value: &str) -> String {
+    let Some((scheme, remainder)) = value.split_once("://") else {
+        return value.to_string();
+    };
+    let masked = if let Some((credentials, location)) = remainder.rsplit_once('@') {
+        let username = credentials
+            .split_once(':')
+            .map(|(name, _)| name)
+            .unwrap_or(credentials);
+        format!("{scheme}://{username}:***@{location}")
+    } else {
+        format!("{scheme}://{remainder}")
+    };
+    let Some((base, query)) = masked.split_once('?') else {
+        return masked;
+    };
+    let query = query
+        .split('&')
+        .map(|part| match part.split_once('=') {
+            Some((key, _)) if key.eq_ignore_ascii_case("password") => format!("{key}=***"),
+            _ => part.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}?{query}")
+}
+
+impl fmt::Display for ApiRateLimitConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ApiRateLimitConfig {{ max_in_flight: {}, telemetry_max_in_flight: {}, auth_max_in_flight: {}, argon2_max_in_flight: {}, request_timeout_ms: {}, telemetry_peer: {}/{}, auth_peer: {}/{}, device: {}/{}, address_book_actor: {}/{}, peer_lru_capacity: {}, device_lru_capacity: {}, actor_lru_capacity: {} }}",
+            self.max_in_flight,
+            self.telemetry_max_in_flight,
+            self.auth_max_in_flight,
+            self.argon2_max_in_flight,
+            self.request_timeout_ms,
+            self.telemetry_peer_capacity,
+            self.telemetry_peer_refill_per_minute,
+            self.auth_peer_capacity,
+            self.auth_peer_refill_per_minute,
+            self.device_capacity,
+            self.device_refill_per_minute,
+            self.address_book_actor_capacity,
+            self.address_book_actor_refill_per_minute,
+            self.peer_lru_capacity,
+            self.device_lru_capacity,
+            self.actor_lru_capacity,
         )
     }
 }
@@ -447,7 +756,8 @@ impl fmt::Display for AppConfig {
         writeln!(f, "{}", self.server)?;
         writeln!(f, "{}", self.rendezvous)?;
         writeln!(f, "{}", self.relay)?;
-        write!(f, "{}", self.pro)
+        writeln!(f, "{}", self.pro)?;
+        write!(f, "{}", self.api_rate_limit)
     }
 }
 
@@ -546,6 +856,23 @@ impl AppConfig {
             .rsplit_once(':')
             .and_then(|(_, p)| p.parse().ok())
             .unwrap_or(RELAY_PORT)
+    }
+
+    /// Extract listen address from server.api_server.
+    pub fn api_server_addr(&self) -> Result<SocketAddr, String> {
+        self.server
+            .api_server
+            .parse::<SocketAddr>()
+            .map_err(|e| format!("invalid api_server '{}': {}", self.server.api_server, e))
+    }
+
+    /// 返回 API、设备状态查询和迁移共同使用的数据库定位符。
+    pub fn database_url(&self) -> &str {
+        if self.server.database_url.trim().is_empty() {
+            &self.server.db_path
+        } else {
+            &self.server.database_url
+        }
     }
 
     /// Update the port portion of server.id_server.
@@ -966,6 +1293,153 @@ fn validate_config(cfg: &AppConfig) -> Result<(), String> {
     checked_listen_port("server.id_server", &cfg.server.id_server)?;
     checked_listen_port("server.relay_server", &cfg.server.relay_server)?;
     checked_listen_port("server.api_server", &cfg.server.api_server)?;
+    if !cfg.server.database_url.trim().is_empty()
+        && !cfg.server.database_url.starts_with("postgres://")
+        && !cfg.server.database_url.starts_with("postgresql://")
+        && !cfg.server.database_url.starts_with("sqlite:")
+    {
+        return Err(
+            "server.database_url must use postgres://, postgresql:// or sqlite: scheme".to_string(),
+        );
+    }
+    if cfg.pro.jwt_secret.trim().len() < 32 {
+        return Err("pro.jwt_secret must be at least 32 characters".to_string());
+    }
+    if cfg.pro.jwt_expiry_hours <= 0 {
+        return Err("pro.jwt_expiry_hours must be positive".to_string());
+    }
+    if cfg.pro.refresh_expiry_days <= 0 {
+        return Err("pro.refresh_expiry_days must be positive".to_string());
+    }
+    validate_allowed_origins(&cfg.pro.oidc.allowed_origins)?;
+    validate_security_config(&cfg.pro.security)?;
+    validate_api_rate_limit(&cfg.api_rate_limit)?;
+    Ok(())
+}
+
+pub fn validate_security_config(cfg: &SecurityConfig) -> Result<(), String> {
+    if !(1..=1024).contains(&cfg.password_min_length) {
+        return Err("pro.security.password_min_length must be within 1..=1024".to_string());
+    }
+    if !(1..=100).contains(&cfg.login_max_failures) {
+        return Err("pro.security.login_max_failures must be within 1..=100".to_string());
+    }
+    if !(1..=10_080).contains(&cfg.login_lock_minutes) {
+        return Err("pro.security.login_lock_minutes must be within 1..=10080".to_string());
+    }
+    if !(1..=525_600).contains(&cfg.session_timeout_minutes) {
+        return Err("pro.security.session_timeout_minutes must be within 1..=525600".to_string());
+    }
+    if !(1..=3650).contains(&cfg.audit_retention_days) {
+        return Err("pro.security.audit_retention_days must be within 1..=3650".to_string());
+    }
+    if cfg.allowed_admin_cidrs.len() > 256 {
+        return Err(
+            "pro.security.allowed_admin_cidrs must contain at most 256 entries".to_string(),
+        );
+    }
+    for cidr in &cfg.allowed_admin_cidrs {
+        let value = cidr.trim();
+        if value.is_empty() || value != cidr {
+            return Err("pro.security.allowed_admin_cidrs contains an invalid CIDR".to_string());
+        }
+        value
+            .parse::<ipnetwork::IpNetwork>()
+            .map_err(|_| "pro.security.allowed_admin_cidrs contains an invalid CIDR".to_string())?;
+    }
+    Ok(())
+}
+
+fn validate_api_rate_limit(cfg: &ApiRateLimitConfig) -> Result<(), String> {
+    const MAX_CONCURRENCY: usize = 65_535;
+    const MAX_BUCKET_VALUE: u64 = 1_000_000;
+    const MAX_LRU_CAPACITY: usize = 1_000_000;
+
+    for (name, value) in [
+        ("max_in_flight", cfg.max_in_flight),
+        ("telemetry_max_in_flight", cfg.telemetry_max_in_flight),
+        ("auth_max_in_flight", cfg.auth_max_in_flight),
+        ("argon2_max_in_flight", cfg.argon2_max_in_flight),
+    ] {
+        if value == 0 || value > MAX_CONCURRENCY {
+            return Err(format!(
+                "api_rate_limit.{name} must be within 1..={MAX_CONCURRENCY}"
+            ));
+        }
+    }
+    if cfg.telemetry_max_in_flight + cfg.auth_max_in_flight >= cfg.max_in_flight {
+        return Err(
+            "api_rate_limit telemetry/auth concurrency must leave capacity for other APIs"
+                .to_string(),
+        );
+    }
+    if !(100..=60_000).contains(&cfg.request_timeout_ms) {
+        return Err("api_rate_limit.request_timeout_ms must be within 100..=60000".to_string());
+    }
+    for (name, value) in [
+        ("telemetry_peer_capacity", cfg.telemetry_peer_capacity),
+        (
+            "telemetry_peer_refill_per_minute",
+            cfg.telemetry_peer_refill_per_minute,
+        ),
+        ("auth_peer_capacity", cfg.auth_peer_capacity),
+        (
+            "auth_peer_refill_per_minute",
+            cfg.auth_peer_refill_per_minute,
+        ),
+        ("device_capacity", cfg.device_capacity),
+        ("device_refill_per_minute", cfg.device_refill_per_minute),
+        (
+            "address_book_actor_capacity",
+            cfg.address_book_actor_capacity,
+        ),
+        (
+            "address_book_actor_refill_per_minute",
+            cfg.address_book_actor_refill_per_minute,
+        ),
+    ] {
+        if value == 0 || value > MAX_BUCKET_VALUE {
+            return Err(format!(
+                "api_rate_limit.{name} must be within 1..={MAX_BUCKET_VALUE}"
+            ));
+        }
+    }
+    for (name, value) in [
+        ("peer_lru_capacity", cfg.peer_lru_capacity),
+        ("device_lru_capacity", cfg.device_lru_capacity),
+        ("actor_lru_capacity", cfg.actor_lru_capacity),
+    ] {
+        if value == 0 || value > MAX_LRU_CAPACITY {
+            return Err(format!(
+                "api_rate_limit.{name} must be within 1..={MAX_LRU_CAPACITY}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_allowed_origins(origins: &[String]) -> Result<(), String> {
+    for origin in origins {
+        let value = origin.trim();
+        http::HeaderValue::from_str(value).map_err(|err| {
+            format!(
+                "pro.oidc.allowed_origins contains invalid header value '{}': {}",
+                origin, err
+            )
+        })?;
+        let uri: http::Uri = value.parse().map_err(|err| {
+            format!(
+                "pro.oidc.allowed_origins contains invalid origin '{}': {}",
+                origin, err
+            )
+        })?;
+        if uri.scheme_str().is_none() || uri.authority().is_none() || uri.path() != "/" {
+            return Err(format!(
+                "pro.oidc.allowed_origins must be origins like https://example.com, got '{}'",
+                origin
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1071,6 +1545,12 @@ fn diff_fields(old: &AppConfig, new: &AppConfig) -> Vec<String> {
     );
     push_diff(
         &mut fields,
+        "server.database_url",
+        &old.server.database_url,
+        &new.server.database_url,
+    );
+    push_diff(
+        &mut fields,
         "rendezvous.servers",
         &old.rendezvous.servers,
         &new.rendezvous.servers,
@@ -1154,8 +1634,38 @@ fn diff_fields(old: &AppConfig, new: &AppConfig) -> Vec<String> {
         &old.pro.tls_key,
         &new.pro.tls_key,
     );
+    push_diff(
+        &mut fields,
+        "pro.jwt_secret",
+        &old.pro.jwt_secret,
+        &new.pro.jwt_secret,
+    );
+    push_diff(
+        &mut fields,
+        "pro.jwt_expiry_hours",
+        &old.pro.jwt_expiry_hours,
+        &new.pro.jwt_expiry_hours,
+    );
+    push_diff(
+        &mut fields,
+        "pro.refresh_expiry_days",
+        &old.pro.refresh_expiry_days,
+        &new.pro.refresh_expiry_days,
+    );
     push_diff(&mut fields, "pro.oidc", &old.pro.oidc, &new.pro.oidc);
     push_diff(&mut fields, "pro.smtp", &old.pro.smtp, &new.pro.smtp);
+    push_diff(
+        &mut fields,
+        "pro.security",
+        &old.pro.security,
+        &new.pro.security,
+    );
+    push_diff(
+        &mut fields,
+        "api_rate_limit",
+        &old.api_rate_limit,
+        &new.api_rate_limit,
+    );
     fields
 }
 
@@ -1187,6 +1697,8 @@ mod tests {
         assert_eq!(cfg.server.id_server, "0.0.0.0:21116");
         assert_eq!(cfg.server.relay_server, "0.0.0.0:21117");
         assert_eq!(cfg.server.api_server, "0.0.0.0:21114");
+        assert_eq!(cfg.server.db_path, default_db_path());
+        assert!(cfg.server.database_url.is_empty());
         assert_eq!(cfg.server.key, "-");
         assert_eq!(cfg.rendezvous.serial, 0);
         assert!(cfg.rendezvous.servers.is_empty());
@@ -1194,6 +1706,28 @@ mod tests {
         assert_eq!(cfg.relay.max_single_bandwidth, 128);
         assert_eq!(cfg.relay.max_total_bandwidth, 1024);
         assert!(!cfg.pro.enabled);
+        assert_eq!(cfg.pro.jwt_expiry_hours, 24);
+        assert_eq!(cfg.pro.refresh_expiry_days, 7);
+        assert!(!cfg.pro.jwt_secret.is_empty());
+        assert_eq!(cfg.pro.security, SecurityConfig::default());
+    }
+
+    #[test]
+    fn database_url_overrides_path_and_is_masked() {
+        let mut cfg = AppConfig::default();
+        cfg.server.database_url =
+            "postgresql://rustdesk:top-secret@db.example.com/rustdesk".to_string();
+        assert_eq!(cfg.database_url(), cfg.server.database_url);
+        let shown = cfg.server.to_string();
+        assert!(shown.contains("postgresql://rustdesk:***@db.example.com/rustdesk"));
+        assert!(!shown.contains("top-secret"));
+
+        cfg.server.database_url =
+            "postgresql://db.example.com/rustdesk?sslmode=require&password=query-secret"
+                .to_string();
+        let shown = cfg.server.to_string();
+        assert!(shown.contains("sslmode=require&password=***"));
+        assert!(!shown.contains("query-secret"));
     }
 
     #[test]
@@ -1206,6 +1740,21 @@ mod tests {
     fn test_relay_server_port() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.relay_server_port(), 21117);
+    }
+
+    #[test]
+    fn test_api_server_addr_parse() {
+        let cfg = AppConfig::default();
+        let addr = cfg.api_server_addr().unwrap();
+        assert_eq!(addr.to_string(), "0.0.0.0:21114");
+    }
+
+    #[test]
+    fn test_api_server_addr_invalid() {
+        let mut cfg = AppConfig::default();
+        cfg.server.api_server = "invalid-addr".to_string();
+        let err = cfg.api_server_addr().unwrap_err();
+        assert!(err.contains("invalid api_server"));
     }
 
     #[test]
@@ -1255,7 +1804,18 @@ mod tests {
     }
 
     #[test]
+    fn test_display_masks_jwt_secret() {
+        let mut cfg = AppConfig::default();
+        cfg.pro.jwt_secret = "jwt-secret".to_string();
+        let output = format!("{}", cfg.pro);
+        assert!(!output.contains("jwt-secret"));
+        assert!(output.contains("***"));
+    }
+
+    #[test]
     fn test_hbbr_port_logic() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_test_env();
         // Simulate: PORT=21116 -> relay port = 21117
         std::env::set_var("PORT", "21116");
         let mut cfg = AppConfig::default();
@@ -1271,7 +1831,7 @@ mod tests {
         };
         cfg.set_relay_server_port(relay_port);
         assert_eq!(cfg.relay_server_port(), 21117);
-        std::env::remove_var("PORT");
+        clear_test_env();
     }
 
     #[test]
@@ -1414,6 +1974,36 @@ max_total_bandwidth = 1024
             .unwrap_err();
         assert!(err.contains("TOML") || err.contains("syntax") || err.contains("invalid"));
         assert_eq!(old.server.id_server, default_id_server());
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_empty_jwt_secret_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_test_env();
+        let path = temp_config(
+            r#"
+[pro]
+jwt_secret = ""
+"#,
+        );
+        let err = AppConfig::load_from_path(Some(&path), ConfigTarget::Hbbs).unwrap_err();
+        assert!(err.contains("pro.jwt_secret"));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_short_jwt_secret_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_test_env();
+        let path = temp_config(
+            r#"
+[pro]
+jwt_secret = "short"
+"#,
+        );
+        let err = AppConfig::load_from_path(Some(&path), ConfigTarget::Hbbs).unwrap_err();
+        assert!(err.contains("pro.jwt_secret"));
         fs::remove_file(path).ok();
     }
 
@@ -1574,6 +2164,39 @@ id_server = "127.0.0.1:21116"
         fs::remove_file(path).ok();
     }
 
+    #[test]
+    fn test_api_rate_limit_defaults_and_invalid_combinations() {
+        let defaults = ApiRateLimitConfig::default();
+        assert_eq!(defaults.max_in_flight, 1024);
+        assert_eq!(defaults.telemetry_max_in_flight, 768);
+        assert_eq!(defaults.auth_max_in_flight, 64);
+        assert!(validate_api_rate_limit(&defaults).is_ok());
+
+        let mut invalid = defaults.clone();
+        invalid.auth_max_in_flight = invalid.max_in_flight;
+        assert!(validate_api_rate_limit(&invalid).is_err());
+        invalid = defaults.clone();
+        invalid.auth_max_in_flight = invalid.max_in_flight - invalid.telemetry_max_in_flight;
+        assert!(validate_api_rate_limit(&invalid).is_err());
+        invalid = defaults.clone();
+        invalid.request_timeout_ms = 99;
+        assert!(validate_api_rate_limit(&invalid).is_err());
+        invalid = defaults;
+        invalid.peer_lru_capacity = 0;
+        assert!(validate_api_rate_limit(&invalid).is_err());
+    }
+
+    #[test]
+    fn test_api_rate_limit_changes_are_cold_reload_fields() {
+        let old = AppConfig::default();
+        let mut new = old.clone();
+        new.api_rate_limit.auth_peer_capacity += 1;
+        let result = old.diff_reload(&new);
+        assert_eq!(result.hot_applied, 0);
+        assert_eq!(result.cold, 1);
+        assert_eq!(result.changed_fields, vec!["api_rate_limit"]);
+    }
+
     fn hbbs_matches(args: &[&str]) -> clap::ArgMatches<'static> {
         App::new("hbbs")
             .args_from_usage(
@@ -1635,6 +2258,9 @@ id_server = "127.0.0.1:21116"
             "RUSTDESK_SERVER__ID_SERVER",
             "RUSTDESK_SERVER__RELAY_SERVER",
             "RUSTDESK_SERVER__KEY",
+            "RUSTDESK_PRO__JWT_SECRET",
+            "RUSTDESK_PRO__JWT_EXPIRY_HOURS",
+            "RUSTDESK_PRO__REFRESH_EXPIRY_DAYS",
             "RUSTDESK_RENDEZVOUS__SERVERS",
             "RUSTDESK_RELAY__SERVERS",
         ] {

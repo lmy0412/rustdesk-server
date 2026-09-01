@@ -158,30 +158,26 @@ pub async fn listen_signal() -> Result<()> {
     use hbb_common::tokio::signal::unix::{signal, SignalKind};
 
     tokio::spawn(async {
-        let mut s = signal(SignalKind::terminate())?;
-        let mut terminate = s.recv();
-        let mut s = signal(SignalKind::interrupt())?;
-        let mut interrupt = s.recv();
-        let mut s = signal(SignalKind::quit())?;
-        let mut quit = s.recv();
-        let mut s = signal(SignalKind::hangup())?;
-        let mut hangup = s.recv();
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut quit = signal(SignalKind::quit())?;
+        let mut hangup = signal(SignalKind::hangup())?;
 
         loop {
             tokio::select! {
-                _ = &mut terminate => {
+                _ = terminate.recv() => {
                     log::info!("signal terminate");
                     break;
                 }
-                _ = &mut interrupt => {
+                _ = interrupt.recv() => {
                     log::info!("signal interrupt");
                     break;
                 }
-                _ = &mut quit => {
+                _ = quit.recv() => {
                     log::info!("signal quit");
                     break;
                 }
-                _ = &mut hangup => {
+                _ = hangup.recv() => {
                     log::info!("signal hangup, reloading config");
                     match crate::config::reload_global_config() {
                         Ok(result) => {
@@ -211,7 +207,6 @@ pub async fn listen_signal() -> Result<()> {
                             log::info!("keeping previous valid configuration");
                         }
                     }
-                    hangup = s.recv();
                 }
             }
         }
