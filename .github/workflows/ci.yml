@@ -176,7 +176,7 @@ jobs:
           "${compose[@]}" up -d --no-build hbbs hbbr
           for attempt in $(seq 1 60); do
             response=$(curl --fail --silent http://127.0.0.1:21114/api/health || true)
-            if printf '%s' "$response" |
+            if [ -n "$response" ] && printf '%s' "$response" |
               jq -e '.status == "ok" and .db == "sqlite"' >/dev/null 2>&1; then
               printf '%s\n' "$response"
               exit 0
@@ -224,10 +224,22 @@ jobs:
           }
           trap cleanup EXIT
 
-          "${compose[@]}" up -d --no-build postgres hbbs hbbr
+          "${compose[@]}" up -d postgres
+          for attempt in $(seq 1 60); do
+            if "${compose[@]}" exec -T postgres pg_isready -U rustdesk -d rustdesk >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              "${compose[@]}" logs --no-color postgres
+              exit 1
+            fi
+            sleep 2
+          done
+
+          "${compose[@]}" up -d --no-build hbbs hbbr
           for attempt in $(seq 1 60); do
             response=$(curl --fail --silent http://127.0.0.1:21114/api/health || true)
-            if printf '%s' "$response" |
+            if [ -n "$response" ] && printf '%s' "$response" |
               jq -e '.status == "ok" and .db == "postgresql"' >/dev/null 2>&1; then
               printf '%s\n' "$response"
               break
