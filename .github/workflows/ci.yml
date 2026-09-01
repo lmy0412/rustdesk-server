@@ -122,7 +122,7 @@ jobs:
       - name: 检查 Docker Compose 配置
         env:
           RUSTDESK_JWT_SECRET: ci-only-jwt-secret-with-at-least-32-bytes
-          RUSTDESK_INITIAL_ADMIN_PASSWORD: ci-only-admin-password
+          RUSTDESK_INITIAL_ADMIN_PASSWORD: CiOnlyAdminPassword1!
           POSTGRES_PASSWORD: ci-postgres-password
         run: |
           RUSTDESK_DATABASE_URL="" docker compose -f docker/docker-compose.pro.yml config >/dev/null
@@ -160,7 +160,7 @@ jobs:
         env:
           RUSTDESK_PRO_IMAGE: rustdesk-server-pro:ci
           RUSTDESK_JWT_SECRET: ci-only-jwt-secret-with-at-least-32-bytes
-          RUSTDESK_INITIAL_ADMIN_PASSWORD: ci-only-admin-password
+          RUSTDESK_INITIAL_ADMIN_PASSWORD: CiOnlyAdminPassword1!
           RUSTDESK_API_BIND: 127.0.0.1
           MAX_DATABASE_CONNECTIONS: "1"
           RUSTDESK_DATABASE_URL: ""
@@ -174,7 +174,7 @@ jobs:
           trap cleanup EXIT
 
           "${compose[@]}" up -d --no-build hbbs hbbr
-          for attempt in $(seq 1 60); do
+          for attempt in $(seq 1 90); do
             response=$(curl --fail --silent http://127.0.0.1:21114/api/health || true)
             if [ -n "$response" ] && printf '%s' "$response" |
               jq -e '.status == "ok" and .db == "sqlite"' >/dev/null 2>&1; then
@@ -208,7 +208,7 @@ jobs:
         env:
           RUSTDESK_PRO_IMAGE: rustdesk-server-pro:ci
           RUSTDESK_JWT_SECRET: ci-only-jwt-secret-with-at-least-32-bytes
-          RUSTDESK_INITIAL_ADMIN_PASSWORD: ci-only-admin-password
+          RUSTDESK_INITIAL_ADMIN_PASSWORD: CiOnlyAdminPassword1!
           RUSTDESK_API_BIND: 127.0.0.1
           MAX_DATABASE_CONNECTIONS: "8"
           POSTGRES_DB: rustdesk
@@ -237,14 +237,14 @@ jobs:
           done
 
           "${compose[@]}" up -d --no-build hbbs hbbr
-          for attempt in $(seq 1 60); do
+          for attempt in $(seq 1 90); do
             response=$(curl --fail --silent http://127.0.0.1:21114/api/health || true)
             if [ -n "$response" ] && printf '%s' "$response" |
               jq -e '.status == "ok" and .db == "postgresql"' >/dev/null 2>&1; then
               printf '%s\n' "$response"
               break
             fi
-            if [ "$attempt" -eq 60 ]; then
+            if [ "$attempt" -eq 90 ]; then
               "${compose[@]}" ps
               "${compose[@]}" logs --no-color
               exit 1
