@@ -16,7 +16,7 @@ use hbb_common::{
     log,
     protobuf::{Message as _, MessageField},
     rendezvous_proto::*,
-    tcp::{listen_any, FramedStream},
+    tcp::{self, listen_any, FramedStream},
     timeout,
     tokio::{
         self,
@@ -31,7 +31,7 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
+use sodiumoxide::crypto::{box_, sign};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -61,9 +61,42 @@ enum RegistrationResult {
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
-    TcpStream(TcpStreamSink),
+    TcpStream {
+        sink: TcpStreamSink,
+        encrypt: Option<tcp::Encrypt>,
+    },
     Ws(WsSink),
 }
+
+fn server_key_exchange(
+    server_sk: &sign::SecretKey,
+) -> ResultType<(RendezvousMessage, box_::SecretKey)> {
+    let (exchange_pk, exchange_sk) = box_::gen_keypair();
+    let mut message = RendezvousMessage::new();
+    message.set_key_exchange(KeyExchange {
+        keys: vec![sign::sign(&exchange_pk.0, server_sk).into()],
+        ..Default::default()
+    });
+    Ok((message, exchange_sk))
+}
+
+fn decode_client_key_exchange(
+    bytes: &[u8],
+    exchange_sk: &box_::SecretKey,
+) -> ResultType<Option<tcp::Encrypt>> {
+    let Ok(message) = RendezvousMessage::parse_from_bytes(bytes) else {
+        return Ok(None);
+    };
+    let Some(rendezvous_message::Union::KeyExchange(exchange)) = message.union else {
+        return Ok(None);
+    };
+    if exchange.keys.len() != 2 {
+        bail!("Handshake failed: invalid key exchange message");
+    }
+    let key = tcp::Encrypt::decode(&exchange.keys[1], &exchange.keys[0], exchange_sk)?;
+    Ok(Some(tcp::Encrypt::new(key)))
+}
+
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
 static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
@@ -1063,8 +1096,12 @@ impl RendezvousServer {
         if let Some(sink) = sink.as_mut() {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
-                    Sink::TcpStream(s) => {
-                        allow_err!(s.send(Bytes::from(bytes)).await);
+                    Sink::TcpStream { sink, encrypt } => {
+                        let bytes = match encrypt {
+                            Some(encrypt) => encrypt.enc(&bytes),
+                            None => bytes,
+                        };
+                        allow_err!(sink.send(Bytes::from(bytes)).await);
                     }
                     Sink::Ws(ws) => {
                         allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
@@ -1427,9 +1464,41 @@ impl RendezvousServer {
                 }
             }
         } else {
-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
-            sink = Some(Sink::TcpStream(a));
+            let mut framed = Framed::new(stream, BytesCodec::new());
+            let mut first_plain = None;
+            let mut recv_encrypt = None;
+
+            // 登录后的官方客户端会先等待服务端发起 KeyExchange；未登录客户端
+            // 会忽略该消息并直接发送普通请求。首帧不是 KeyExchange 时继续按
+            // OSS 协议处理，从而同时兼容两类客户端。
+            if let Some(server_sk) = self.inner.sk.as_ref() {
+                let (exchange, exchange_sk) = server_key_exchange(server_sk)?;
+                framed.send(Bytes::from(exchange.write_to_bytes()?)).await?;
+                if let Ok(Some(Ok(bytes))) = timeout(30_000, framed.next()).await {
+                    match decode_client_key_exchange(&bytes, &exchange_sk)? {
+                        Some(encrypt) => recv_encrypt = Some(encrypt),
+                        None => first_plain = Some(bytes),
+                    }
+                } else {
+                    return Ok(());
+                }
+            }
+
+            let (a, mut b) = framed.split();
+            sink = Some(Sink::TcpStream {
+                sink: a,
+                encrypt: recv_encrypt.clone(),
+            });
+            if let Some(bytes) = first_plain {
+                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                    return Ok(());
+                }
+            }
             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+                let mut bytes = bytes;
+                if let Some(encrypt) = recv_encrypt.as_mut() {
+                    encrypt.dec(&mut bytes)?;
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
@@ -1630,8 +1699,59 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
 mod tests {
     use super::*;
     use crate::database::Database;
+    use sodiumoxide::crypto::secretbox;
     use sqlx::{Connection, Executor, SqliteConnection};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn authenticated_client_key_exchange_establishes_matching_cipher() {
+        let (server_pk, server_sk) = sign::gen_keypair();
+        let (server_message, exchange_sk) = server_key_exchange(&server_sk).unwrap();
+        let server_exchange = match server_message.union {
+            Some(rendezvous_message::Union::KeyExchange(exchange)) => exchange,
+            _ => panic!("服务端必须发送 KeyExchange"),
+        };
+        assert_eq!(server_exchange.keys.len(), 1);
+        let signed_exchange_pk = sign::verify(&server_exchange.keys[0], &server_pk).unwrap();
+        let mut server_exchange_pk = [0_u8; box_::PUBLICKEYBYTES];
+        server_exchange_pk.copy_from_slice(&signed_exchange_pk);
+
+        let (client_exchange_pk, client_exchange_sk) = box_::gen_keypair();
+        let client_key = secretbox::gen_key();
+        let nonce = box_::Nonce([0_u8; box_::NONCEBYTES]);
+        let sealed_key = box_::seal(
+            &client_key.0,
+            &nonce,
+            &box_::PublicKey(server_exchange_pk),
+            &client_exchange_sk,
+        );
+        let mut client_message = RendezvousMessage::new();
+        client_message.set_key_exchange(KeyExchange {
+            keys: vec![client_exchange_pk.0.to_vec().into(), sealed_key.into()],
+            ..Default::default()
+        });
+
+        let mut server_encrypt =
+            decode_client_key_exchange(&client_message.write_to_bytes().unwrap(), &exchange_sk)
+                .unwrap()
+                .expect("客户端 KeyExchange 应建立加密器");
+        let mut client_encrypt = tcp::Encrypt::new(client_key);
+        let mut encrypted = BytesMut::from(client_encrypt.enc(b"authenticated-punch").as_slice());
+        server_encrypt.dec(&mut encrypted).unwrap();
+        assert_eq!(&encrypted[..], b"authenticated-punch");
+    }
+
+    #[test]
+    fn ordinary_first_frame_remains_plain_oss_protocol() {
+        let (_, exchange_sk) = box_::gen_keypair();
+        let mut message = RendezvousMessage::new();
+        message.set_test_nat_request(TestNatRequest::new());
+        assert!(
+            decode_client_key_exchange(&message.write_to_bytes().unwrap(), &exchange_sk,)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn protocol_mapping_does_not_occupy_unapproved_numbers() {
