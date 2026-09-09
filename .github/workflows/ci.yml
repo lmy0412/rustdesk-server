@@ -1,0 +1,260 @@
+name: 发布 CI
+
+on:
+  push:
+    branches:
+      - master
+      - dev
+  pull_request:
+    branches:
+      - master
+      - dev
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  rust:
+    name: Rust 格式与测试
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: rustdesk_ci
+          POSTGRES_USER: rustdesk
+          POSTGRES_PASSWORD: ci-postgres-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rustdesk -d rustdesk_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang cmake libssl-dev pkg-config
+
+      - name: 安装 Rust 1.90
+        run: |
+          rustup toolchain install 1.90.0 --profile minimal --component rustfmt
+          rustup default 1.90.0
+
+      - name: 缓存 Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: 运行 Rust 测试
+        env:
+          TEST_POSTGRES_URL: postgresql://rustdesk:ci-postgres-password@127.0.0.1:5432/rustdesk_ci
+        run: cargo test --locked --all-features
+
+      # build.rs 会在首次编译时生成 src/version.rs，格式检查必须放在测试之后。
+      - name: 检查 Rust 格式
+        run: cargo fmt --package hbbs -- --check
+
+  web:
+    name: Web 测试与构建
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 运行测试
+        run: npm test
+
+      - name: 构建控制台
+        run: npm run build
+
+      - name: 检查构建产物是否同步
+        working-directory: .
+        run: git diff --exit-code -- web/dist
+
+  operations:
+    name: 运维配置检查
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+
+      - name: 检查 Shell 语法
+        run: sh -n scripts/backup.sh scripts/restore.sh
+
+      - name: 检查 Docker Compose 配置
+        env:
+          RUSTDESK_JWT_SECRET: ci-only-jwt-secret-with-at-least-32-bytes
+          RUSTDESK_INITIAL_ADMIN_PASSWORD: CiOnlyAdminPassword1!
+          POSTGRES_PASSWORD: ci-postgres-password
+        run: |
+          RUSTDESK_DATABASE_URL="" docker compose -f docker/docker-compose.pro.yml config >/dev/null
+          RUSTDESK_DATABASE_URL=postgresql://rustdesk:ci-postgres-password@postgres:5432/rustdesk docker compose -f docker/docker-compose.pro.yml --profile postgres config >/dev/null
+
+      - name: 检查 Nginx 配置
+        run: |
+          cert_dir="$RUNNER_TEMP/letsencrypt/live/rustdesk.example.com"
+          mkdir -p "$cert_dir"
+          openssl req -x509 -nodes -newkey rsa:2048 -days 1 -subj "/CN=rustdesk.example.com" -keyout "$cert_dir/privkey.pem" -out "$cert_dir/fullchain.pem" >/dev/null 2>&1
+          docker run --rm -v "$PWD/docker/nginx.pro.conf:/etc/nginx/conf.d/default.conf:ro" -v "$RUNNER_TEMP/letsencrypt:/etc/letsencrypt:ro" nginx:1.28-alpine nginx -t
+
+      - name: 检查 Caddy 配置
+        run: |
+          docker run --rm -v "$PWD/docker/Caddyfile.pro:/etc/caddy/Caddyfile:ro" caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile
+
+  production-image:
+    name: 生产镜像与双数据库冒烟测试
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: 构建生产镜像
+        run: docker build -f docker/Dockerfile.pro -t rustdesk-server-pro:ci .
+
+      - name: 检查非 root 运行身份
+        run: |
+          test "$(docker image inspect rustdesk-server-pro:ci --format '{{.Config.User}}')" = "rustdesk:rustdesk"
+
+      - name: SQLite Compose 冒烟测试
+        env:
+          RUSTDESK_PRO_IMAGE: rustdesk-server-pro:ci
+          RUSTDESK_JWT_SECRET: ci-only-jwt-secret-with-at-least-32-bytes
+          RUSTDESK_INITIAL_ADMIN_PASSWORD: CiOnlyAdminPassword1!
+          RUSTDESK_API_BIND: 127.0.0.1
+          MAX_DATABASE_CONNECTIONS: "1"
+          RUSTDESK_DATABASE_URL: ""
+        run: |
+          set -euo pipefail
+          project=rustdesk-ci-sqlite
+          compose=(docker compose -p "$project" -f docker/docker-compose.pro.yml)
+          cleanup() {
+            "${compose[@]}" down -v --remove-orphans || true
+          }
+          trap cleanup EXIT
+
+          "${compose[@]}" up -d --no-build hbbs hbbr
+          for attempt in $(seq 1 90); do
+            response=$(curl --fail --silent http://127.0.0.1:21114/api/health || true)
+            if [ -n "$response" ] && printf '%s' "$response" |
+              jq -e '.status == "ok" and .db == "sqlite"' >/dev/null 2>&1; then
+              printf '%s\n' "$response"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          "${compose[@]}" ps
+          "${compose[@]}" logs --no-color
+          exit 1
+
+      - name: SQLite 备份恢复冒烟测试
+        run: |
+          docker run --rm --entrypoint sh rustdesk-server-pro:ci -c '
+            set -eu
+            work=$(mktemp -d)
+            echo "db_path = \"$work/source.sqlite3\"" > "$work/config.toml"
+            sqlite3 "$work/source.sqlite3" "CREATE TABLE smoke(value INTEGER); INSERT INTO smoke VALUES(42);"
+            echo license-data > "$work/license"
+            echo private-key > "$work/id_ed25519"
+            echo public-key > "$work/id_ed25519.pub"
+            /usr/local/libexec/rustdesk-server/backup.sh --output "$work/backup.tar.gz" --database-path "$work/source.sqlite3" --config "$work/config.toml" --license "$work/license" --key "$work/id_ed25519" --key "$work/id_ed25519.pub"
+            /usr/local/libexec/rustdesk-server/restore.sh --archive "$work/backup.tar.gz" --target-dir "$work/restored" --allow-running
+            test "$(sqlite3 "$work/restored/db_v2.sqlite3" "SELECT value FROM smoke;")" = 42
+            test "$(stat -c %a "$work/backup.tar.gz")" = 600
+          '
+
+      - name: PostgreSQL Compose 与备份恢复冒烟测试
+        env:
+          RUSTDESK_PRO_IMAGE: rustdesk-server-pro:ci
+          RUSTDESK_JWT_SECRET: ci-only-jwt-secret-with-at-least-32-bytes
+          RUSTDESK_INITIAL_ADMIN_PASSWORD: CiOnlyAdminPassword1!
+          RUSTDESK_API_BIND: 127.0.0.1
+          MAX_DATABASE_CONNECTIONS: "8"
+          POSTGRES_DB: rustdesk
+          POSTGRES_USER: rustdesk
+          POSTGRES_PASSWORD: ci-postgres-password
+          RUSTDESK_DATABASE_URL: postgresql://rustdesk:ci-postgres-password@postgres:5432/rustdesk
+        run: |
+          set -euo pipefail
+          project=rustdesk-ci-postgres
+          compose=(docker compose -p "$project" -f docker/docker-compose.pro.yml --profile postgres)
+          cleanup() {
+            "${compose[@]}" down -v --remove-orphans || true
+          }
+          trap cleanup EXIT
+
+          "${compose[@]}" up -d postgres
+          for attempt in $(seq 1 60); do
+            if "${compose[@]}" exec -T postgres pg_isready -U rustdesk -d rustdesk >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              "${compose[@]}" logs --no-color postgres
+              exit 1
+            fi
+            sleep 2
+          done
+
+          "${compose[@]}" up -d --no-build hbbs hbbr
+          for attempt in $(seq 1 90); do
+            response=$(curl --fail --silent http://127.0.0.1:21114/api/health || true)
+            if [ -n "$response" ] && printf '%s' "$response" |
+              jq -e '.status == "ok" and .db == "postgresql"' >/dev/null 2>&1; then
+              printf '%s\n' "$response"
+              break
+            fi
+            if [ "$attempt" -eq 90 ]; then
+              "${compose[@]}" ps
+              "${compose[@]}" logs --no-color
+              exit 1
+            fi
+            sleep 2
+          done
+
+          "${compose[@]}" exec -T hbbs /usr/local/libexec/rustdesk-server/backup.sh --output /var/lib/rustdesk/postgresql-backup.tar.gz --database-url "$RUSTDESK_DATABASE_URL" --config /etc/rustdesk-server/config.toml
+          "${compose[@]}" stop hbbs
+          "${compose[@]}" exec -T postgres createdb -U rustdesk rustdesk_restore
+          "${compose[@]}" run --rm --no-deps --entrypoint /usr/local/libexec/rustdesk-server/restore.sh hbbs --archive /var/lib/rustdesk/postgresql-backup.tar.gz --target-dir /var/lib/rustdesk/restore --database-url postgresql://rustdesk:ci-postgres-password@postgres:5432/rustdesk_restore --allow-running
+          table_exists=$("${compose[@]}" exec -T postgres psql -U rustdesk -d rustdesk_restore -tAc "SELECT to_regclass('public.users') IS NOT NULL")
+          test "$table_exists" = t

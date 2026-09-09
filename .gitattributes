@@ -1,1 +1,12 @@
 * text=auto
+
+# SQLx 会把迁移文件的原始字节写入数据库校验和。线上库由不同阶段的构建创建，
+# 因此固定每份既有迁移的换行符，确保 Windows 与 Linux 构建生成相同校验和。
+migrations/20240101000001_add_core_schema.sql text eol=crlf
+migrations/20240101000002_add_pro_schema.sql text eol=crlf
+migrations/20240622000003_add_users_token_version.sql text eol=crlf
+migrations/20240622000004_add_oidc_fields.sql text eol=crlf
+migrations/20260723000005_add_device_quota.sql text eol=crlf
+migrations/20260723000006_add_device_group_tags.sql text eol=lf
+migrations/20260727000007_add_address_book.sql text eol=lf
+migrations/20260818000008_add_audit_security.sql text eol=crlf

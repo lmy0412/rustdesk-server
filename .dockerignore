@@ -1,0 +1,13 @@
+.git
+.github
+.codex
+.workbuddy
+target
+web/node_modules
+web/dist
+*.sqlite3
+*.sqlite3-*
+*.db
+*.log
+*.tar
+*.tar.gz
